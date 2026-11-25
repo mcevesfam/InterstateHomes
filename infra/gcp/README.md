@@ -123,7 +123,7 @@ Generate cryptographically strong keys in PowerShell:
 
 ## Connect GitHub & Create CI/CD Triggers
 
-1. In Google Cloud Console, navigate to **Cloud Build -> Repositories (2nd gen)** in region **`us-west1`** and connect GitHub repository **`MCDesignCO/InterstateHomes`**.
+1. In Google Cloud Console, navigate to **Cloud Build -> Repositories (2nd gen)** in region **`us-west1`** and connect GitHub repository **`mcevesfam/InterstateHomes`**.
 2. Create the **Staging** trigger (`staging` branch):
    ```powershell
    gcloud builds triggers create github `
@@ -132,7 +132,7 @@ Generate cryptographically strong keys in PowerShell:
      --repository="projects/<PROJECT_ID>/locations/us-west1/connections/<CONNECTION_NAME>/repositories/<REPO_RESOURCE>" `
      --branch-pattern="^staging$" `
      --build-config="cloudbuild.yaml" `
-     --substitutions="_ENV=staging,_REGION=us-west1,_REPO=interstate-homes,_API_SERVICE=interstate-api-staging,_WEB_SERVICE=interstate-web-staging,_MIGRATE_JOB=interstate-migrate-staging,_GCS_BUCKET=<PROJECT_ID>-interstate-docs-staging" `
+     --substitutions="_ENV=staging,_REGION=us-west1,_REPO=interstate-homes,_API_SERVICE=interstate-api-staging,_WEB_SERVICE=interstate-web-staging,_MIGRATE_JOB=interstate-migrate-staging,_GCS_BUCKET=<PROJECT_ID>-interstate-docs-staging,_CORS_ORIGIN=https://staging.interstatehomes.com,_EMAIL_PROVIDER=console,_EMAIL_FROM=estimating@interstatehomes.com" `
      --project="<PROJECT_ID>" `
      --quiet
    ```
@@ -144,10 +144,56 @@ Generate cryptographically strong keys in PowerShell:
      --repository="projects/<PROJECT_ID>/locations/us-west1/connections/<CONNECTION_NAME>/repositories/<REPO_RESOURCE>" `
      --branch-pattern="^main$" `
      --build-config="cloudbuild.yaml" `
-     --substitutions="_ENV=prod,_REGION=us-west1,_REPO=interstate-homes,_API_SERVICE=interstate-api-prod,_WEB_SERVICE=interstate-web-prod,_MIGRATE_JOB=interstate-migrate-prod,_GCS_BUCKET=<PROJECT_ID>-interstate-docs-prod" `
+     --substitutions="_ENV=prod,_REGION=us-west1,_REPO=interstate-homes,_API_SERVICE=interstate-api-prod,_WEB_SERVICE=interstate-web-prod,_MIGRATE_JOB=interstate-migrate-prod,_GCS_BUCKET=<PROJECT_ID>-interstate-docs-prod,_CORS_ORIGIN=https://interstatehomes.com,_EMAIL_PROVIDER=console,_EMAIL_FROM=estimating@interstatehomes.com" `
      --project="<PROJECT_ID>" `
      --quiet
    ```
+
+---
+
+## Custom Domain (`interstatehomes.com` on Bluehost) & Outbound Email (Resend)
+
+Because `apps/web` proxies `/api/*` server-side to `API_INTERNAL_URL`, only the **Web** Cloud Run service (`interstate-web-staging` / `interstate-web-prod`) needs a public custom domain.
+
+### Step 1: Verify `interstatehomes.com` Ownership with Google (One-Time)
+1. Run `gcloud domains verify interstatehomes.com --project=<PROJECT_ID>` (or open Google Search Console / Webmaster Central) to obtain the `google-site-verification=...` `TXT` token.
+2. In **Bluehost → Domains → `interstatehomes.com` → DNS / Zone Editor**, add:
+   - **Type:** `TXT` | **Host/Name:** `@` | **Value:** `google-site-verification=<your-token>` | **TTL:** `300` (or lowest allowed)
+3. Click **Verify** in Google Search Console, then confirm:
+   ```powershell
+   gcloud domains list-user-verified --project=<PROJECT_ID> --format="json" --quiet
+   ```
+
+### Step 2: Connect Staging (`staging.interstatehomes.com`)
+1. Deploy `interstate-web-staging` to `us-west1` at least once.
+2. Ensure Staging GCS bucket CORS is applied (`infra/gcp/cors-staging.json`):
+   ```powershell
+   gcloud storage buckets update gs://<PROJECT_ID>-interstate-docs-staging `
+     --cors-file=infra/gcp/cors-staging.json `
+     --project=<PROJECT_ID> `
+     --quiet
+   ```
+3. In **Google Cloud Console → Cloud Run → Manage Custom Domains → Add Mapping**:
+   - Service: `interstate-web-staging` (`us-west1`)
+   - Domain: `interstatehomes.com`, Subdomain: `staging` (`staging.interstatehomes.com`)
+4. In **Bluehost DNS Zone Editor**, add the DNS record Google displays:
+   - **Type:** `CNAME` | **Host/Name:** `staging` | **Points to:** `ghs.googlehosted.com.`
+5. Wait ~15–60 minutes for DNS propagation and Google-managed TLS certificate issuance.
+
+### Step 3: Connect Production (`interstatehomes.com` & `www.interstatehomes.com`) — After Approval
+1. Provision Production (`.\infra\gcp\provision-env.ps1 -ProjectId "<PROJECT_ID>" -Env prod -Execute`), populate all 5 `interstate-prod-*` secrets, and deploy `interstate-web-prod` (`main` branch).
+2. In **Google Cloud Console → Cloud Run → Manage Custom Domains → Add Mapping**:
+   - Map apex `interstatehomes.com` → `interstate-web-prod` (note the **4 `A`** and **4 `AAAA`** IP records displayed).
+   - Map `www.interstatehomes.com` → `interstate-web-prod` (note the **`CNAME`** `ghs.googlehosted.com.` record; `apps/web/next.config.ts` permanently redirects `www` → `https://interstatehomes.com`).
+3. In **Bluehost DNS Zone Editor**:
+   - Remove the old parked `A` records (`204.11.56.246`) on `@` and `www`.
+   - Add the exact **4 `A`** + **4 `AAAA`** records for `@` and **`CNAME`** `www` → `ghs.googlehosted.com.`.
+
+### Step 4: Configure Outbound Email via Resend (Deferred Until Sender Address Finalized)
+1. In **Resend Dashboard → Domains → Add Domain**, add `interstatehomes.com` (US region).
+2. Copy Resend's `DKIM` (`TXT`/`CNAME`) and `SPF` (`MX`/`TXT` on `send` subdomain) records into **Bluehost DNS Zone Editor**, plus add a DMARC record:
+   - **Type:** `TXT` | **Host/Name:** `_dmarc` | **Value:** `v=DMARC1; p=none; rua=mailto:<your-chosen-sender>@interstatehomes.com`
+3. Verify the domain in Resend, then update your Cloud Build trigger/deploy substitutions to `_EMAIL_PROVIDER=resend` and `_EMAIL_FROM=<your-chosen-sender>@interstatehomes.com`.
 
 ---
 
@@ -159,7 +205,7 @@ $sha = (git rev-parse --short HEAD)
 gcloud builds submit . `
   --config="cloudbuild.yaml" `
   --region="us-west1" `
-  --substitutions="COMMIT_SHA=$sha,_ENV=staging,_REGION=us-west1,_REPO=interstate-homes,_API_SERVICE=interstate-api-staging,_WEB_SERVICE=interstate-web-staging,_MIGRATE_JOB=interstate-migrate-staging,_GCS_BUCKET=<PROJECT_ID>-interstate-docs-staging" `
+  --substitutions="COMMIT_SHA=$sha,_ENV=staging,_REGION=us-west1,_REPO=interstate-homes,_API_SERVICE=interstate-api-staging,_WEB_SERVICE=interstate-web-staging,_MIGRATE_JOB=interstate-migrate-staging,_GCS_BUCKET=<PROJECT_ID>-interstate-docs-staging,_CORS_ORIGIN=https://staging.interstatehomes.com,_EMAIL_PROVIDER=console,_EMAIL_FROM=estimating@interstatehomes.com" `
   --project="<PROJECT_ID>" `
   --quiet
 ```

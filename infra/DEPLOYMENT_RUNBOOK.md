@@ -26,7 +26,7 @@ Route traffic back to a previous healthy revision in Cloud Run Console or via `g
 ## 2. Self-Hosted Docker Compose Deployment (Alternative / Local Verification)
 
 ```bash
-git clone https://github.com/MCDesignCO/InterstateHomes.git interstate-homes
+git clone https://github.com/mcevesfam/InterstateHomes.git interstate-homes
 cd interstate-homes
 cp .env.example .env
 # Populate DATABASE_URL, APP_ENCRYPTION_KEY, SESSION_SECRET, S3_* (or GCS_BUCKET), DOCUSEAL_API_KEY

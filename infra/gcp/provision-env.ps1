@@ -30,7 +30,7 @@
 
 .PARAMETER GithubRepoResource
     Optional 2nd-gen Cloud Build GitHub repository resource path, e.g.
-    "projects/<PROJECT_ID>/locations/us-west1/connections/github/repositories/MCDesignCO-InterstateHomes".
+    "projects/<PROJECT_ID>/locations/us-west1/connections/github/repositories/mcevesfam-InterstateHomes".
     If omitted, prints instructions for creating the GitHub trigger once connected in Cloud Console.
 
 .PARAMETER Execute
@@ -59,6 +59,12 @@ param(
 
     [string]$BucketName = '',
 
+    [string]$CorsOrigin = '',
+
+    [string]$EmailProvider = 'console',
+
+    [string]$EmailFrom = 'estimating@interstatehomes.com',
+
     [string]$CloudBuildServiceAccount = '',
 
     [string]$GithubRepoResource = '',
@@ -71,6 +77,15 @@ $ErrorActionPreference = 'Stop'
 
 if ([string]::IsNullOrWhiteSpace($BucketName)) {
     $BucketName = "$ProjectId-interstate-docs-$Env".ToLowerInvariant()
+}
+
+if ([string]::IsNullOrWhiteSpace($CorsOrigin)) {
+    $CorsOrigin = if ($Env -eq 'prod') { 'https://interstatehomes.com' } else { 'https://staging.interstatehomes.com' }
+}
+
+$CorsFile = Join-Path $PSScriptRoot "cors-$Env.json"
+if (-not (Test-Path $CorsFile)) {
+    throw "CORS policy file not found: $CorsFile"
 }
 
 $ApiService   = "interstate-api-$Env"
@@ -187,6 +202,13 @@ Invoke-GcloudStep -Label "Create private GCS bucket (gs://$BucketName)" -AllowAl
     '--quiet'
 )
 
+Invoke-GcloudStep -Label "Configure GCS bucket CORS (gs://$BucketName from cors-$Env.json)" -Arguments @(
+    'storage', 'buckets', 'update', "gs://$BucketName",
+    "--cors-file=$CorsFile",
+    "--project=$ProjectId",
+    '--quiet'
+)
+
 # 4. Create dedicated least-privilege runtime service accounts
 Invoke-GcloudStep -Label "Create API runtime service account ($ApiSaName)" -AllowAlreadyExists -Arguments @(
     'iam', 'service-accounts', 'create', $ApiSaName,
@@ -268,7 +290,7 @@ foreach ($runtimeSa in @($ApiSaEmail, $WebSaEmail)) {
 }
 
 # 8. Create Cloud Build GitHub trigger (if 2nd-gen repository resource was provided)
-$Substitutions = "_ENV=$Env,_REGION=$Region,_REPO=$RepoName,_API_SERVICE=$ApiService,_WEB_SERVICE=$WebService,_MIGRATE_JOB=$MigrateJob,_GCS_BUCKET=$BucketName"
+$Substitutions = "_ENV=$Env,_REGION=$Region,_REPO=$RepoName,_API_SERVICE=$ApiService,_WEB_SERVICE=$WebService,_MIGRATE_JOB=$MigrateJob,_GCS_BUCKET=$BucketName,_CORS_ORIGIN=$CorsOrigin,_EMAIL_PROVIDER=$EmailProvider,_EMAIL_FROM=$EmailFrom"
 
 if (-not [string]::IsNullOrWhiteSpace($GithubRepoResource)) {
     Invoke-GcloudStep -Label "Create Cloud Build GitHub trigger ($TriggerName -> $BranchRegex)" -AllowAlreadyExists -Arguments @(
@@ -285,7 +307,7 @@ if (-not [string]::IsNullOrWhiteSpace($GithubRepoResource)) {
 } else {
     Write-Host ""
     Write-Host "==> [Next Step: Connect GitHub & Create Trigger]" -ForegroundColor Cyan
-    Write-Host "Connect https://github.com/MCDesignCO/InterstateHomes in Cloud Build -> Repositories (2nd gen) in region $Region,"
+    Write-Host "Connect https://github.com/mcevesfam/InterstateHomes in Cloud Build -> Repositories (2nd gen) in region $Region,"
     Write-Host "then re-run or execute:"
     Write-Host "  gcloud builds triggers create github --name=$TriggerName --region=$Region --repository=projects/$ProjectId/locations/$Region/connections/<CONN>/repositories/<REPO> --branch-pattern=`"$BranchRegex`" --build-config=cloudbuild.yaml --substitutions=`"$Substitutions`" --project=$ProjectId --quiet"
 }
