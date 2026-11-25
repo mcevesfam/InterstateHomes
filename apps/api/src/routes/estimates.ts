@@ -151,59 +151,66 @@ async function loadPostgresHomeEstimate(homeId: string) {
 }
 
 export async function registerEstimateRoutes(app: FastifyInstance) {
-  app.get('/api/homes/:homeId/estimate', { schema: { tags: ['Estimates'] } }, async (request, reply) => {
-    const { homeId } = request.params as { homeId: string };
-    const canSeeInternal = canAccess(request.actor.role, 'financials:view_internal');
+  app.get(
+    '/api/homes/:homeId/estimate',
+    {
+      preHandler: [requirePermission('budgets:view')],
+      schema: { tags: ['Estimates'] },
+    },
+    async (request, reply) => {
+      const { homeId } = request.params as { homeId: string };
+      const canSeeInternal = canAccess(request.actor.role, 'financials:view_internal');
 
-    if (isUsingDemoStore()) {
-      const home = demoStore.homes.find((h) => h.id === homeId);
-      const est = demoStore.estimates.get(homeId);
-      if (!home || !est) return reply.status(404).send({ error: 'EstimateNotFound' });
+      if (isUsingDemoStore()) {
+        const home = demoStore.homes.find((h) => h.id === homeId);
+        const est = demoStore.estimates.get(homeId);
+        if (!home || !est) return reply.status(404).send({ error: 'EstimateNotFound' });
 
-      const lines = est.lines.filter(
+        const lines = est.lines.filter(
+          (l) => canSeeInternal || !INTERNAL_ONLY_COST_CODES.has(l.costCode)
+        );
+        const totalEstimatedCents = lines.reduce((sum, l) => sum + l.extendedCents, 0);
+
+        return {
+          home: {
+            ...home,
+            soldAmountCents: canSeeInternal ? home.soldAmountCents : null,
+          },
+          estimate: {
+            id: est.id,
+            homeId: est.homeId,
+            versionNumber: est.versionNumber,
+            status: est.status,
+            totalEstimatedCents,
+            lines,
+          },
+        };
+      }
+
+      const loaded = await loadPostgresHomeEstimate(homeId);
+      if (!loaded) return reply.status(404).send({ error: 'EstimateNotFound' });
+
+      const lines = loaded.estimate.lines.filter(
         (l) => canSeeInternal || !INTERNAL_ONLY_COST_CODES.has(l.costCode)
       );
       const totalEstimatedCents = lines.reduce((sum, l) => sum + l.extendedCents, 0);
 
       return {
         home: {
-          ...home,
-          soldAmountCents: canSeeInternal ? home.soldAmountCents : null,
+          ...loaded.home,
+          soldAmountCents: canSeeInternal ? loaded.home.soldAmountCents : null,
         },
         estimate: {
-          id: est.id,
-          homeId: est.homeId,
-          versionNumber: est.versionNumber,
-          status: est.status,
+          id: loaded.estimate.id,
+          homeId: loaded.estimate.homeId,
+          versionNumber: loaded.estimate.versionNumber,
+          status: loaded.estimate.status,
           totalEstimatedCents,
           lines,
         },
       };
     }
-
-    const loaded = await loadPostgresHomeEstimate(homeId);
-    if (!loaded) return reply.status(404).send({ error: 'EstimateNotFound' });
-
-    const lines = loaded.estimate.lines.filter(
-      (l) => canSeeInternal || !INTERNAL_ONLY_COST_CODES.has(l.costCode)
-    );
-    const totalEstimatedCents = lines.reduce((sum, l) => sum + l.extendedCents, 0);
-
-    return {
-      home: {
-        ...loaded.home,
-        soldAmountCents: canSeeInternal ? loaded.home.soldAmountCents : null,
-      },
-      estimate: {
-        id: loaded.estimate.id,
-        homeId: loaded.estimate.homeId,
-        versionNumber: loaded.estimate.versionNumber,
-        status: loaded.estimate.status,
-        totalEstimatedCents,
-        lines,
-      },
-    };
-  });
+  );
 
   app.get(
     '/api/homes/:homeId/estimate/homeowner',
@@ -279,9 +286,24 @@ export async function registerEstimateRoutes(app: FastifyInstance) {
         return reply.status(400).send({ error: 'ValidationError', details: parsed.error.flatten() });
       }
 
+      if (costCode === '00') {
+        return reply.status(400).send({
+          error: 'InvalidCostCode',
+          message: 'Cost code "00" (Uncategorized) is not estimateable.',
+        });
+      }
+
       if (isUsingDemoStore()) {
+        const home = demoStore.homes.find((h) => h.id === homeId);
         const est = demoStore.estimates.get(homeId);
-        if (!est) return reply.status(404).send({ error: 'EstimateNotFound' });
+        if (!home || !est) return reply.status(404).send({ error: 'EstimateNotFound' });
+
+        if (home.stage === 'live_budget') {
+          return reply.status(409).send({
+            error: 'BudgetLocked',
+            message: 'This home already has an approved live budget. Create a new estimate version to modify lines.',
+          });
+        }
 
         const line = est.lines.find((l) => l.costCode === costCode);
         if (!line) return reply.status(404).send({ error: 'CostCodeLineNotFound' });
@@ -327,13 +349,23 @@ export async function registerEstimateRoutes(app: FastifyInstance) {
         return reply.status(404).send({ error: 'EstimateNotFound' });
       }
       const db = getDb();
-      const [est] = await db
-        .select()
-        .from(estimates)
-        .where(eq(estimates.homeId, homeId))
-        .orderBy(desc(estimates.versionNumber))
-        .limit(1);
-      if (!est) return reply.status(404).send({ error: 'EstimateNotFound' });
+      const [[home], [est]] = await Promise.all([
+        db.select().from(homes).where(eq(homes.id, homeId)).limit(1),
+        db
+          .select()
+          .from(estimates)
+          .where(eq(estimates.homeId, homeId))
+          .orderBy(desc(estimates.versionNumber))
+          .limit(1),
+      ]);
+      if (!home || !est) return reply.status(404).send({ error: 'EstimateNotFound' });
+
+      if (home.stage === 'live_budget' || est.status === 'approved') {
+        return reply.status(409).send({
+          error: 'BudgetLocked',
+          message: 'This estimate is approved/live-budgeted and locked against direct edits.',
+        });
+      }
 
       const [existingLine] = await db
         .select()
@@ -406,11 +438,16 @@ export async function registerEstimateRoutes(app: FastifyInstance) {
         .where(eq(estimateLines.id, existingLine.id))
         .returning();
 
-      const [cc] = await db
-        .select()
-        .from(costCodes)
-        .where(eq(costCodes.code, costCode))
-        .limit(1);
+      const [[cc], lineQuotes, allSubs, subCodeRows] = await Promise.all([
+        db.select().from(costCodes).where(eq(costCodes.code, costCode)).limit(1),
+        db
+          .select()
+          .from(quotes)
+          .where(and(eq(quotes.homeId, homeId), eq(quotes.costCode, costCode))),
+        db.select({ id: subCompanies.id, legalName: subCompanies.legalName }).from(subCompanies),
+        db.select().from(subCostCodes).where(eq(subCostCodes.costCode, costCode)),
+      ]);
+
       const [cls] = cc
         ? await db
             .select()
@@ -418,6 +455,11 @@ export async function registerEstimateRoutes(app: FastifyInstance) {
             .where(eq(costClassifications.code, cc.classificationCode))
             .limit(1)
         : [undefined];
+
+      const subMap = new Map(allSubs.map((s) => [s.id, s.legalName]));
+      const preferredSubs = new Set(
+        subCodeRows.filter((sc) => sc.isPreferred).map((sc) => sc.subCompanyId)
+      );
 
       await writeAuditLog({
         actorUserId: request.actor.userId,
@@ -454,7 +496,12 @@ export async function registerEstimateRoutes(app: FastifyInstance) {
           isAllowanceOrFixed: updated!.isAllowanceOrFixed,
           showOnHomeownerPdf: updated!.showOnHomeownerPdf,
           notes: updated!.notes ?? '',
-          competingSubQuotes: [],
+          competingSubQuotes: lineQuotes.map((q) => ({
+            subId: q.subCompanyId,
+            subName: subMap.get(q.subCompanyId) ?? q.subCompanyId,
+            totalCents: q.quotedTotalCents,
+            isPreferred: preferredSubs.has(q.subCompanyId),
+          })),
         },
       };
     }

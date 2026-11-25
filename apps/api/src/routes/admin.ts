@@ -1,9 +1,12 @@
+import crypto from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
-import { desc, eq } from 'drizzle-orm';
+import { and, desc, eq, isNull, sql } from 'drizzle-orm';
+import { z } from 'zod';
 import {
   DEFAULT_SYSTEM_SETTINGS,
   updateSystemSettingsSchema,
   type SystemSettingsConfig,
+  type UserRole,
 } from '@interstate/shared';
 import { demoStore } from '../data/demo-store.js';
 import { getDb } from '../db/client.js';
@@ -21,13 +24,48 @@ import {
   jobCostBudgets,
   purchaseOrders,
   quotes,
+  sessions,
   subCompanies,
   systemSettings,
   users,
   warehouseRefreshRuns,
 } from '../db/schema/index.js';
-import { isUsingDemoStore, requirePermission } from '../security/auth-plugin.js';
-import { writeAuditLog } from '../security/audit.js';
+import {
+  getMinPasswordLength,
+  getOrInitDemoAuthState,
+  isUsingDemoStore,
+  requirePermission,
+  revokeUserDemoSessions,
+  setDemoAuthState,
+} from '../security/auth-plugin.js';
+import { isValidUuid, writeAuditLog } from '../security/audit.js';
+import { hashPassword } from '../security/crypto.js';
+
+const userRoleSchema = z.enum([
+  'admin',
+  'estimator_approver',
+  'project_manager',
+  'subcontractor',
+  'homeowner',
+]);
+
+const createAdminUserSchema = z.object({
+  email: z.string().email().max(200),
+  fullName: z.string().min(1).max(120),
+  role: userRoleSchema,
+  password: z.string().min(1).max(200).optional(),
+  subCompanyId: z.string().nullable().optional(),
+  approvalLimitCents: z.number().int().nonnegative().nullable().optional(),
+});
+
+const updateAdminUserSchema = z.object({
+  role: userRoleSchema.optional(),
+  status: z.enum(['active', 'disabled', 'locked']).optional(),
+  approvalLimitCents: z.number().int().nonnegative().nullable().optional(),
+  subCompanyId: z.string().nullable().optional(),
+  unlock: z.boolean().optional(),
+  resetMfa: z.boolean().optional(),
+});
 
 function mapSettingsRow(row: typeof systemSettings.$inferSelect | undefined): SystemSettingsConfig {
   if (!row) return { ...DEFAULT_SYSTEM_SETTINGS };
@@ -49,18 +87,25 @@ function mapSettingsRow(row: typeof systemSettings.$inferSelect | undefined): Sy
 }
 
 export async function registerAdminRoutes(app: FastifyInstance) {
-  app.get('/api/admin/settings', { schema: { tags: ['Admin'] } }, async () => {
-    if (isUsingDemoStore()) {
-      return { settings: demoStore.settings };
+  app.get(
+    '/api/admin/settings',
+    {
+      preHandler: [requirePermission('budgets:view')],
+      schema: { tags: ['Admin'] },
+    },
+    async () => {
+      if (isUsingDemoStore()) {
+        return { settings: demoStore.settings };
+      }
+      const db = getDb();
+      const [row] = await db
+        .select()
+        .from(systemSettings)
+        .where(eq(systemSettings.id, 'default'))
+        .limit(1);
+      return { settings: mapSettingsRow(row) };
     }
-    const db = getDb();
-    const [row] = await db
-      .select()
-      .from(systemSettings)
-      .where(eq(systemSettings.id, 'default'))
-      .limit(1);
-    return { settings: mapSettingsRow(row) };
-  });
+  );
 
   app.patch(
     '/api/admin/settings',
@@ -166,7 +211,18 @@ export async function registerAdminRoutes(app: FastifyInstance) {
     },
     async () => {
       if (isUsingDemoStore()) {
-        return { users: demoStore.users };
+        const enriched = await Promise.all(
+          demoStore.users.map(async (u) => {
+            const authState = await getOrInitDemoAuthState(u.id);
+            return {
+              ...u,
+              status: authState?.status ?? u.status,
+              mfaEnabled: Boolean(authState?.mfaEnabled && authState?.mfaSecretEncrypted),
+              failedLoginAttempts: authState?.failedLoginAttempts ?? 0,
+            };
+          })
+        );
+        return { users: enriched };
       }
 
       const db = getDb();
@@ -179,7 +235,9 @@ export async function registerAdminRoutes(app: FastifyInstance) {
           subCompanyId: users.subCompanyId,
           status: users.status,
           mfaEnabled: users.mfaEnabled,
+          mfaSecretEncrypted: users.mfaSecretEncrypted,
           approvalLimitCents: users.approvalLimitCents,
+          failedLoginAttempts: users.failedLoginAttempts,
           lastLoginAt: users.lastLoginAt,
         })
         .from(users)
@@ -187,9 +245,338 @@ export async function registerAdminRoutes(app: FastifyInstance) {
 
       return {
         users: rows.map((u) => ({
-          ...u,
+          id: u.id,
+          email: u.email,
+          fullName: u.fullName,
+          role: u.role,
+          subCompanyId: u.subCompanyId,
+          status: u.status,
+          mfaEnabled: Boolean(u.mfaEnabled && u.mfaSecretEncrypted),
+          approvalLimitCents: u.approvalLimitCents,
+          failedLoginAttempts: u.failedLoginAttempts,
           lastLoginAt: u.lastLoginAt ? u.lastLoginAt.toISOString() : null,
         })),
+      };
+    }
+  );
+
+  app.post(
+    '/api/admin/users',
+    {
+      preHandler: [requirePermission('users:manage')],
+      schema: { tags: ['Admin'], summary: 'Create/invite a user account with scrypt password' },
+    },
+    async (request, reply) => {
+      const parsed = createAdminUserSchema.safeParse(request.body);
+      if (!parsed.success) {
+        return reply.status(400).send({ error: 'ValidationError', details: parsed.error.flatten() });
+      }
+      const d = parsed.data;
+      const emailNormalized = d.email.trim().toLowerCase();
+      const minLen = await getMinPasswordLength();
+
+      let generatedPassword: string | undefined;
+      const plainPassword =
+        d.password && d.password.length > 0
+          ? d.password
+          : (generatedPassword = `IH-${crypto.randomBytes(10).toString('base64url')}!9`);
+
+      if (plainPassword.length < minLen) {
+        return reply.status(400).send({
+          error: 'WeakPassword',
+          message: `Password must be at least ${minLen} characters long.`,
+        });
+      }
+
+      const passwordHash = await hashPassword(plainPassword);
+      const subCompanyId =
+        d.role === 'subcontractor' && d.subCompanyId ? d.subCompanyId : null;
+
+      if (isUsingDemoStore()) {
+        if (demoStore.users.some((u) => u.email.toLowerCase() === emailNormalized)) {
+          return reply.status(409).send({
+            error: 'DuplicateEmail',
+            message: `A user with email "${emailNormalized}" already exists.`,
+          });
+        }
+        const id = `usr-${Date.now().toString(36)}`;
+        const newUser = {
+          id,
+          email: emailNormalized,
+          fullName: d.fullName.trim(),
+          role: d.role as UserRole,
+          subCompanyId,
+          status: 'active' as const,
+          approvalLimitCents: d.approvalLimitCents ?? null,
+          lastLoginAt: '',
+        };
+        demoStore.users.unshift(newUser);
+        setDemoAuthState(id, {
+          userId: id,
+          passwordHash,
+          mfaEnabled: false,
+          mfaSecretEncrypted: null,
+          failedLoginAttempts: 0,
+          status: 'active',
+        });
+
+        await writeAuditLog({
+          actorUserId: request.actor.userId,
+          actorEmail: request.actor.email,
+          action: 'USER_CREATED',
+          entityType: 'user',
+          entityId: id,
+          ipAddress: request.ip,
+          afterValues: { email: emailNormalized, role: d.role, subCompanyId },
+        });
+
+        return reply.status(201).send({
+          user: {
+            ...newUser,
+            mfaEnabled: false,
+            failedLoginAttempts: 0,
+          },
+          ...(generatedPassword ? { temporaryPassword: generatedPassword } : {}),
+        });
+      }
+
+      const db = getDb();
+      const [existing] = await db
+        .select({ id: users.id })
+        .from(users)
+        .where(sql`lower(${users.email}) = ${emailNormalized}`)
+        .limit(1);
+      if (existing) {
+        return reply.status(409).send({
+          error: 'DuplicateEmail',
+          message: `A user with email "${emailNormalized}" already exists.`,
+        });
+      }
+
+      let validSubId: string | null = null;
+      if (subCompanyId) {
+        if (!isValidUuid(subCompanyId)) {
+          return reply.status(400).send({ error: 'InvalidSubcontractorId' });
+        }
+        const [subRow] = await db
+          .select({ id: subCompanies.id })
+          .from(subCompanies)
+          .where(eq(subCompanies.id, subCompanyId))
+          .limit(1);
+        if (!subRow) {
+          return reply.status(404).send({ error: 'SubcontractorNotFound' });
+        }
+        validSubId = subRow.id;
+      }
+
+      const [inserted] = await db
+        .insert(users)
+        .values({
+          email: emailNormalized,
+          fullName: d.fullName.trim(),
+          role: d.role,
+          subCompanyId: validSubId,
+          passwordHash,
+          mfaEnabled: false,
+          approvalLimitCents: d.approvalLimitCents ?? null,
+          status: 'active',
+          failedLoginAttempts: 0,
+        })
+        .returning();
+
+      await writeAuditLog({
+        actorUserId: request.actor.userId,
+        actorEmail: request.actor.email,
+        action: 'USER_CREATED',
+        entityType: 'user',
+        entityId: inserted!.id,
+        ipAddress: request.ip,
+        afterValues: { email: emailNormalized, role: d.role, subCompanyId: validSubId },
+      });
+
+      return reply.status(201).send({
+        user: {
+          id: inserted!.id,
+          email: inserted!.email,
+          fullName: inserted!.fullName,
+          role: inserted!.role,
+          subCompanyId: inserted!.subCompanyId,
+          status: inserted!.status,
+          mfaEnabled: false,
+          approvalLimitCents: inserted!.approvalLimitCents,
+          failedLoginAttempts: inserted!.failedLoginAttempts,
+          lastLoginAt: null,
+        },
+        ...(generatedPassword ? { temporaryPassword: generatedPassword } : {}),
+      });
+    }
+  );
+
+  app.patch(
+    '/api/admin/users/:id',
+    {
+      preHandler: [requirePermission('users:manage')],
+      schema: {
+        tags: ['Admin'],
+        summary: 'Update user role/status/approval limit, unlock locked account, or reset MFA',
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params as { id: string };
+      const parsed = updateAdminUserSchema.safeParse(request.body);
+      if (!parsed.success) {
+        return reply.status(400).send({ error: 'ValidationError', details: parsed.error.flatten() });
+      }
+      const d = parsed.data;
+
+      if (isUsingDemoStore()) {
+        const user = demoStore.users.find((u) => u.id === id);
+        if (!user) return reply.status(404).send({ error: 'UserNotFound' });
+        const authState = (await getOrInitDemoAuthState(user.id))!;
+
+        const before = {
+          role: user.role,
+          status: authState.status,
+          approvalLimitCents: user.approvalLimitCents,
+          failedLoginAttempts: authState.failedLoginAttempts,
+          mfaEnabled: authState.mfaEnabled,
+        };
+
+        if (d.role !== undefined) user.role = d.role;
+        if (d.approvalLimitCents !== undefined) user.approvalLimitCents = d.approvalLimitCents;
+        if (d.subCompanyId !== undefined) user.subCompanyId = d.subCompanyId;
+
+        if (d.unlock || d.status === 'active') {
+          authState.status = 'active';
+          authState.failedLoginAttempts = 0;
+          user.status = 'active';
+        } else if (d.status === 'disabled' || d.status === 'locked') {
+          authState.status = d.status;
+          user.status = d.status === 'disabled' ? 'disabled' : 'active';
+          revokeUserDemoSessions(user.id);
+        }
+
+        if (d.resetMfa) {
+          authState.mfaEnabled = false;
+          authState.mfaSecretEncrypted = null;
+        }
+
+        await writeAuditLog({
+          actorUserId: request.actor.userId,
+          actorEmail: request.actor.email,
+          action: 'USER_UPDATED',
+          entityType: 'user',
+          entityId: user.id,
+          ipAddress: request.ip,
+          beforeValues: before,
+          afterValues: {
+            role: user.role,
+            status: authState.status,
+            approvalLimitCents: user.approvalLimitCents,
+            failedLoginAttempts: authState.failedLoginAttempts,
+            mfaEnabled: authState.mfaEnabled,
+          },
+        });
+
+        return {
+          user: {
+            ...user,
+            status: authState.status,
+            mfaEnabled: Boolean(authState.mfaEnabled && authState.mfaSecretEncrypted),
+            failedLoginAttempts: authState.failedLoginAttempts,
+          },
+        };
+      }
+
+      if (!isValidUuid(id)) {
+        return reply.status(404).send({ error: 'UserNotFound' });
+      }
+      const db = getDb();
+      const [existing] = await db.select().from(users).where(eq(users.id, id)).limit(1);
+      if (!existing) return reply.status(404).send({ error: 'UserNotFound' });
+
+      const nextStatus =
+        d.unlock || d.status === 'active'
+          ? 'active'
+          : d.status !== undefined
+            ? d.status
+            : existing.status;
+
+      const nextFailedAttempts =
+        d.unlock || d.status === 'active' ? 0 : existing.failedLoginAttempts;
+
+      const nextSubId =
+        d.subCompanyId === undefined
+          ? existing.subCompanyId
+          : d.subCompanyId === null
+            ? null
+            : isValidUuid(d.subCompanyId)
+              ? d.subCompanyId
+              : null;
+
+      const updated = await db.transaction(async (tx) => {
+        const [row] = await tx
+          .update(users)
+          .set({
+            role: d.role ?? existing.role,
+            status: nextStatus,
+            failedLoginAttempts: nextFailedAttempts,
+            approvalLimitCents:
+              d.approvalLimitCents !== undefined
+                ? d.approvalLimitCents
+                : existing.approvalLimitCents,
+            subCompanyId: nextSubId,
+            mfaEnabled: d.resetMfa ? false : existing.mfaEnabled,
+            mfaSecretEncrypted: d.resetMfa ? null : existing.mfaSecretEncrypted,
+            updatedAt: new Date(),
+          })
+          .where(eq(users.id, existing.id))
+          .returning();
+
+        if (nextStatus !== 'active') {
+          await tx
+            .update(sessions)
+            .set({ revokedAt: new Date() })
+            .where(and(eq(sessions.userId, existing.id), isNull(sessions.revokedAt)));
+        }
+
+        return row!;
+      });
+
+      await writeAuditLog({
+        actorUserId: request.actor.userId,
+        actorEmail: request.actor.email,
+        action: 'USER_UPDATED',
+        entityType: 'user',
+        entityId: updated.id,
+        ipAddress: request.ip,
+        beforeValues: {
+          role: existing.role,
+          status: existing.status,
+          approvalLimitCents: existing.approvalLimitCents,
+          failedLoginAttempts: existing.failedLoginAttempts,
+        },
+        afterValues: {
+          role: updated.role,
+          status: updated.status,
+          approvalLimitCents: updated.approvalLimitCents,
+          failedLoginAttempts: updated.failedLoginAttempts,
+        },
+      });
+
+      return {
+        user: {
+          id: updated.id,
+          email: updated.email,
+          fullName: updated.fullName,
+          role: updated.role,
+          subCompanyId: updated.subCompanyId,
+          status: updated.status,
+          mfaEnabled: Boolean(updated.mfaEnabled && updated.mfaSecretEncrypted),
+          approvalLimitCents: updated.approvalLimitCents,
+          failedLoginAttempts: updated.failedLoginAttempts,
+          lastLoginAt: updated.lastLoginAt ? updated.lastLoginAt.toISOString() : null,
+        },
       };
     }
   );
@@ -449,14 +836,14 @@ export async function registerAdminRoutes(app: FastifyInstance) {
           tables,
           finishedAt: finishedAt.toISOString(),
         };
-      } catch (err) {
+      } catch {
         await db
           .update(warehouseRefreshRuns)
           .set({ status: 'failed', finishedAt: new Date() })
           .where(eq(warehouseRefreshRuns.id, run!.id));
         return reply.status(500).send({
           error: 'WarehouseRefreshFailed',
-          message: err instanceof Error ? err.message : 'Unknown warehouse refresh error',
+          message: 'Warehouse refresh failed. Check server logs for details.',
           runId: run!.id,
         });
       }

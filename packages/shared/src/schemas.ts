@@ -1,6 +1,10 @@
 import { z } from 'zod';
 import { isCostCodeTextValid } from './cost-codes.js';
 
+export const isoDateSchema = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, 'Date must be in YYYY-MM-DD format.');
+
 export const costCodeTextSchema = z
   .string()
   .min(2)
@@ -47,6 +51,9 @@ export const createSubcontractorSchema = z.object({
   address: z.string().max(300).optional(),
   mainPhone: z.string().max(30).optional(),
   website: z.string().max(200).optional(),
+  primaryContactName: z.string().min(1).max(120).optional(),
+  primaryContactEmail: z.string().email().max(200).optional(),
+  primaryContactPhone: z.string().max(30).optional(),
   hasVehiclesOnSite: z.boolean().default(true),
   costCodesServed: z.array(costCodeTextSchema).min(1),
   subdivisionsServed: z.array(z.string()).default(['ALL']),
@@ -82,7 +89,7 @@ export const createClarificationSchema = z.object({
   category: z.enum(['question', 'scope_gap', 'plan_conflict', 'price_dispute']),
   title: z.string().min(3).max(200),
   description: z.string().min(3).max(2000),
-  dueDate: z.string().optional(),
+  dueDate: isoDateSchema.optional(),
 });
 
 export const updateSystemSettingsSchema = z.object({

@@ -27,6 +27,54 @@ function buildApiUrl(path: string): string {
   return apiPath;
 }
 
+function formatFieldLabel(field: string): string {
+  return field
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/_/g, ' ')
+    .replace(/^./, (c) => c.toUpperCase());
+}
+
+function formatValidationDetails(details: unknown): string | null {
+  if (!details || typeof details !== 'object') return null;
+  const d = details as {
+    fieldErrors?: Record<string, string[] | undefined>;
+    formErrors?: string[];
+  };
+  const parts: string[] = [];
+
+  if (Array.isArray(d.formErrors)) {
+    for (const msg of d.formErrors) {
+      if (typeof msg === 'string' && msg.trim()) {
+        parts.push(msg.trim());
+      }
+    }
+  }
+
+  if (d.fieldErrors && typeof d.fieldErrors === 'object') {
+    for (const [field, errs] of Object.entries(d.fieldErrors)) {
+      if (Array.isArray(errs) && errs.length > 0) {
+        const cleaned = errs.filter((e): e is string => typeof e === 'string' && e.trim().length > 0);
+        if (cleaned.length > 0) {
+          parts.push(`${formatFieldLabel(field)}: ${cleaned.join(', ')}`);
+        }
+      }
+    }
+  }
+
+  return parts.length > 0 ? parts.join(' · ') : null;
+}
+
+export interface ApiError extends Error {
+  status: number;
+  data?: Record<string, unknown>;
+}
+
+export function isReauthRequiredError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const apiErr = err as Partial<ApiError>;
+  return apiErr.status === 401 && apiErr.data?.error === 'ReauthRequired';
+}
+
 export async function apiFetch<T>(
   path: string,
   options: RequestInit & { role?: UserRole; subCompanyId?: string } = {}
@@ -83,8 +131,27 @@ export async function apiFetch<T>(
   const echoedRequestId = res.headers.get('x-request-id') || requestId || 'unknown';
 
   if (!res.ok) {
-    const errBody = await res.json().catch(() => ({ message: res.statusText }));
-    const message = errBody.message ?? errBody.error ?? 'API request failed';
+    const errBody = (await res.json().catch(() => ({ message: res.statusText }))) as Record<
+      string,
+      unknown
+    >;
+    const errCode = typeof errBody.error === 'string' ? errBody.error : '';
+    const rawMessage = typeof errBody.message === 'string' ? errBody.message.trim() : '';
+    const validationSummary = formatValidationDetails(errBody.details);
+
+    let message: string;
+    if (rawMessage && validationSummary) {
+      message = `${rawMessage} (${validationSummary})`;
+    } else if (validationSummary) {
+      message = validationSummary;
+    } else if (rawMessage) {
+      message = rawMessage;
+    } else if (errCode) {
+      message = errCode;
+    } else {
+      message = 'API request failed';
+    }
+
     if (isBrowser) {
       recordNetworkEvent({
         timestamp: new Date().toISOString(),
@@ -96,11 +163,16 @@ export async function apiFetch<T>(
         ok: false,
         errorMessage: message,
       });
+
+      if (res.status === 401 && (errCode === 'SessionExpired' || errCode === 'SessionTimeout')) {
+        window.dispatchEvent(new Event('interstate:session-expired'));
+      }
     }
+
     throw Object.assign(new Error(message), {
       status: res.status,
       data: errBody,
-    });
+    }) as ApiError;
   }
 
   if (isBrowser) {

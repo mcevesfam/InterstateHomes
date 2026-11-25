@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
-import { and, asc, desc, eq, inArray } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import {
   approveFeedbackSchema,
   canAccess,
@@ -32,7 +32,12 @@ import { sendAndLogEmail } from '../services/email.js';
 import { generateFixPlan, triageFeedbackTurn } from '../services/feedback-ai.js';
 import { createApprovedFixGitHubIssue, formatAgentFixBriefMarkdown } from '../services/github-issues.js';
 import { getCorrelatedServerLogs } from '../services/server-log-buffer.js';
-import { getPresignedDownloadUrl, getStorageProvider, uploadBufferToStorage } from '../services/storage.js';
+import {
+  downloadBufferFromStorage,
+  getPresignedDownloadUrl,
+  getStorageProvider,
+  uploadBufferToStorage,
+} from '../services/storage.js';
 
 const MAX_SCREENSHOT_BYTES = 5 * 1024 * 1024;
 const MAX_DEMO_SCREENSHOTS = 30;
@@ -93,14 +98,52 @@ function parseDataUrlImage(dataUrl: string): { mimeType: string; buffer: Buffer;
   return { mimeType, buffer, ext };
 }
 
-function getDemoScreenshotInline(storageKey: string | null | undefined): { mimeType: string; base64: string } | null {
-  if (!storageKey) return null;
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function sanitizeActorKeySegment(userId: string): string {
+  return userId.replace(/[^a-zA-Z0-9_-]/g, '') || 'anon';
+}
+
+function isOwnedFeedbackScreenshotKey(storageKey: string, actorUserId: string): boolean {
+  const safeActor = sanitizeActorKeySegment(actorUserId);
+  const escaped = safeActor.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`^feedback-screenshots/${escaped}/\\d+-[0-9a-f]{12}\\.(png|jpg|webp)$`).test(
+    storageKey
+  );
+}
+
+function isValidFeedbackScreenshotKey(storageKey: string): boolean {
+  return /^feedback-screenshots\/[a-zA-Z0-9_-]+\/\d+-[0-9a-f]{12}\.(png|jpg|webp)$/.test(storageKey);
+}
+
+async function getScreenshotInline(
+  storageKey: string | null | undefined
+): Promise<{ mimeType: string; base64: string } | null> {
+  if (!storageKey || !isValidFeedbackScreenshotKey(storageKey)) return null;
   const entry = demoStore.feedbackScreenshots.get(storageKey);
-  if (!entry) return null;
-  return {
-    mimeType: entry.contentType,
-    base64: entry.buffer.toString('base64'),
-  };
+  if (entry) {
+    return {
+      mimeType: entry.contentType,
+      base64: entry.buffer.toString('base64'),
+    };
+  }
+  if (getStorageProvider() !== 'mock') {
+    const downloaded = await downloadBufferFromStorage(storageKey);
+    if (downloaded && downloaded.buffer.length <= MAX_SCREENSHOT_BYTES) {
+      return {
+        mimeType: downloaded.contentType,
+        base64: downloaded.buffer.toString('base64'),
+      };
+    }
+  }
+  return null;
 }
 
 function isTicketOwner(item: { reporterUserId: string | null; subCompanyId: string | null }, actor: RequestActor): boolean {
@@ -264,7 +307,7 @@ async function notifyAdminPlanReady(item: DemoFeedbackItem, plan: FeedbackFixPla
       triggeredByUserId: isValidUuid(triggeredByUserId) ? triggeredByUserId : '00000000-0000-0000-0000-000000000000',
       relatedEntityType: 'feedback_item',
       relatedEntityId: item.id,
-      html: `<p><strong>${item.ticketKey}</strong> (${item.category} / ${item.severity}) submitted by ${item.reporterName} on <code>${item.pagePath}</code>.</p><p><strong>AI Plan v${plan.version}:</strong> ${plan.summary}</p><p>Review and approve inside the Interstate Homes Admin Feedback Console (/feedback).</p>`,
+      html: `<p><strong>${escapeHtml(item.ticketKey)}</strong> (${escapeHtml(item.category)} / ${escapeHtml(item.severity)}) submitted by ${escapeHtml(item.reporterName)} on <code>${escapeHtml(item.pagePath)}</code>.</p><p><strong>AI Plan v${plan.version}:</strong> ${escapeHtml(plan.summary)}</p><p>Review and approve inside the Interstate Homes Admin Feedback Console (/feedback).</p>`,
     });
   } catch {
     // Non-blocking notification failure must not fail feedback creation
@@ -281,7 +324,7 @@ async function notifyReporterOutcome(item: DemoFeedbackItem, triggeredByUserId: 
       triggeredByUserId: isValidUuid(triggeredByUserId) ? triggeredByUserId : '00000000-0000-0000-0000-000000000000',
       relatedEntityType: 'feedback_item',
       relatedEntityId: item.id,
-      html: `<p>Your feedback ticket <strong>${item.ticketKey}</strong> is now <strong>${item.status}</strong>.</p>${item.resolutionNote ? `<p>${item.resolutionNote}</p>` : ''}`,
+      html: `<p>Your feedback ticket <strong>${escapeHtml(item.ticketKey)}</strong> is now <strong>${escapeHtml(item.status)}</strong>.</p>${item.resolutionNote ? `<p>${escapeHtml(item.resolutionNote)}</p>` : ''}`,
     });
   } catch {
     // Non-blocking notification failure
@@ -349,7 +392,17 @@ export async function registerFeedbackRoutes(app: FastifyInstance) {
         return reply.status(400).send({ error: 'ValidationError', details: parsed.error.flatten() });
       }
 
-      const screenshot = getDemoScreenshotInline(parsed.data.screenshotStorageKey);
+      if (
+        parsed.data.screenshotStorageKey &&
+        !isOwnedFeedbackScreenshotKey(parsed.data.screenshotStorageKey, request.actor.userId)
+      ) {
+        return reply.status(403).send({
+          error: 'ForbiddenScreenshotKey',
+          message: 'Screenshot storage key is invalid or does not belong to your account.',
+        });
+      }
+
+      const screenshot = await getScreenshotInline(parsed.data.screenshotStorageKey);
       const response = await triageFeedbackTurn({
         messages: parsed.data.messages,
         pageContext: parsed.data.pageContext,
@@ -382,7 +435,8 @@ export async function registerFeedbackRoutes(app: FastifyInstance) {
         });
       }
 
-      const storageKey = `feedback-screenshots/${Date.now()}-${crypto.randomBytes(6).toString('hex')}.${decoded.ext}`;
+      const safeActorSegment = sanitizeActorKeySegment(request.actor.userId);
+      const storageKey = `feedback-screenshots/${safeActorSegment}/${Date.now()}-${crypto.randomBytes(6).toString('hex')}.${decoded.ext}`;
       const provider = getStorageProvider();
 
       if (isUsingDemoStore() || provider === 'mock') {
@@ -472,6 +526,16 @@ export async function registerFeedbackRoutes(app: FastifyInstance) {
       }
 
       const input = parsed.data;
+      if (
+        input.screenshotStorageKey &&
+        !isOwnedFeedbackScreenshotKey(input.screenshotStorageKey, request.actor.userId)
+      ) {
+        return reply.status(403).send({
+          error: 'ForbiddenScreenshotKey',
+          message: 'Screenshot storage key is invalid or does not belong to your account.',
+        });
+      }
+
       const sanitizedClientSnapshot = sanitizeDiagnosticSnapshot(input.diagnosticSnapshot);
       const serverLogs = getCorrelatedServerLogs(
         sanitizedClientSnapshot.requestIds,
@@ -482,11 +546,11 @@ export async function registerFeedbackRoutes(app: FastifyInstance) {
         serverLogs,
       });
 
-      const screenshotInline = getDemoScreenshotInline(input.screenshotStorageKey);
+      const screenshotInline = await getScreenshotInline(input.screenshotStorageKey);
       const nowIso = new Date().toISOString();
 
-      let itemId: string;
-      let ticketKey: string;
+      let itemId = '';
+      let ticketKey = '';
 
       if (isUsingDemoStore()) {
         const seq = demoStore.nextFeedbackSeq++;
@@ -610,33 +674,52 @@ export async function registerFeedbackRoutes(app: FastifyInstance) {
 
       // PostgreSQL path
       const db = getDb();
-      const existingRows = await db.select({ id: feedbackItems.id }).from(feedbackItems);
-      ticketKey = `FB-${101 + existingRows.length}`;
+      let inserted: typeof feedbackItems.$inferSelect | undefined;
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const [maxRow] = await db
+          .select({
+            maxNum: sql<number>`COALESCE(MAX(CAST(SUBSTRING(${feedbackItems.ticketKey} FROM 4) AS INTEGER)), 100)`,
+          })
+          .from(feedbackItems)
+          .where(sql`${feedbackItems.ticketKey} ~ '^FB-[0-9]+$'`);
+        const nextNum = Number(maxRow?.maxNum ?? 100) + 1 + attempt;
+        ticketKey = `FB-${nextNum}`;
+        try {
+          const [row] = await db
+            .insert(feedbackItems)
+            .values({
+              ticketKey,
+              category: input.category,
+              severity: input.severity,
+              status: 'plan_generating',
+              title: redactString(input.title, 200),
+              description: redactString(input.description, 8000),
+              reporterUserId: isValidUuid(request.actor.userId) ? request.actor.userId : null,
+              reporterEmail: request.actor.email,
+              reporterName: request.actor.fullName,
+              reporterRole: request.actor.role,
+              subCompanyId: isValidUuid(request.actor.subCompanyId) ? request.actor.subCompanyId : null,
+              pagePath: redactString(input.pageContext.pathname, 300),
+              pageTitle: input.pageContext.pageTitle ? redactString(input.pageContext.pageTitle, 200) : null,
+              pageContextJson: input.pageContext,
+              diagnosticSnapshotJson: fullSnapshot,
+              screenshotStorageKey: input.screenshotStorageKey ?? null,
+            })
+            .returning();
+          inserted = row;
+          break;
+        } catch (err) {
+          const pgCode = (err as { code?: string })?.code;
+          if (pgCode === '23505' && attempt < 4) continue;
+          throw err;
+        }
+      }
+      if (!inserted) {
+        return reply.status(500).send({ error: 'TicketKeyGenerationFailed' });
+      }
 
-      const [inserted] = await db
-        .insert(feedbackItems)
-        .values({
-          ticketKey,
-          category: input.category,
-          severity: input.severity,
-          status: 'plan_generating',
-          title: redactString(input.title, 200),
-          description: redactString(input.description, 8000),
-          reporterUserId: isValidUuid(request.actor.userId) ? request.actor.userId : null,
-          reporterEmail: request.actor.email,
-          reporterName: request.actor.fullName,
-          reporterRole: request.actor.role,
-          subCompanyId: isValidUuid(request.actor.subCompanyId) ? request.actor.subCompanyId : null,
-          pagePath: redactString(input.pageContext.pathname, 300),
-          pageTitle: input.pageContext.pageTitle ? redactString(input.pageContext.pageTitle, 200) : null,
-          pageContextJson: input.pageContext,
-          diagnosticSnapshotJson: fullSnapshot,
-          screenshotStorageKey: input.screenshotStorageKey ?? null,
-        })
-        .returning();
-
-      itemId = inserted!.id;
-      const mappedItem = mapPgItemToDemoShape(inserted!);
+      itemId = inserted.id;
+      const mappedItem = mapPgItemToDemoShape(inserted);
 
       const transcriptRows = (
         input.transcript.length > 0
@@ -670,42 +753,46 @@ export async function registerFeedbackRoutes(app: FastifyInstance) {
         screenshot: screenshotInline,
       });
 
-      const [planRow] = await db
-        .insert(feedbackFixPlans)
-        .values({
-          feedbackItemId: itemId,
-          version: 1,
-          modelName: generated.modelName,
-          summary: generated.plan.summary,
-          rootCauseOrGoal: generated.plan.rootCauseOrGoal,
-          affectedFilesJson: generated.plan.affectedFiles,
-          schemaChangesJson: generated.plan.schemaChanges,
-          securityRbacImpact: generated.plan.securityRbacImpact,
-          implementationStepsJson: generated.plan.implementationSteps,
-          verificationStepsJson: generated.plan.verificationSteps,
-          riskLevel: generated.plan.riskLevel,
-          estimatedEffort: generated.plan.estimatedEffort,
-          status: 'pending_approval',
-        })
-        .returning();
+      const { planRow, sysMsg, updatedRow } = await db.transaction(async (tx) => {
+        const [plan] = await tx
+          .insert(feedbackFixPlans)
+          .values({
+            feedbackItemId: itemId,
+            version: 1,
+            modelName: generated.modelName,
+            summary: generated.plan.summary,
+            rootCauseOrGoal: generated.plan.rootCauseOrGoal,
+            affectedFilesJson: generated.plan.affectedFiles,
+            schemaChangesJson: generated.plan.schemaChanges,
+            securityRbacImpact: generated.plan.securityRbacImpact,
+            implementationStepsJson: generated.plan.implementationSteps,
+            verificationStepsJson: generated.plan.verificationSteps,
+            riskLevel: generated.plan.riskLevel,
+            estimatedEffort: generated.plan.estimatedEffort,
+            status: 'pending_approval',
+          })
+          .returning();
 
-      const [sysMsg] = await db
-        .insert(feedbackMessages)
-        .values({
-          feedbackItemId: itemId,
-          senderType: 'system',
-          senderUserId: null,
-          senderName: 'System',
-          body: `Ticket ${ticketKey} logged with page context & diagnostic snapshot. An AI fix plan (v1) has been generated and sent for Admin approval.`,
-          visibleToReporter: true,
-        })
-        .returning();
+        const [sys] = await tx
+          .insert(feedbackMessages)
+          .values({
+            feedbackItemId: itemId,
+            senderType: 'system',
+            senderUserId: null,
+            senderName: 'System',
+            body: `Ticket ${ticketKey} logged with page context & diagnostic snapshot. An AI fix plan (v1) has been generated and sent for Admin approval.`,
+            visibleToReporter: true,
+          })
+          .returning();
 
-      const [updatedRow] = await db
-        .update(feedbackItems)
-        .set({ status: 'plan_ready', updatedAt: new Date() })
-        .where(eq(feedbackItems.id, itemId))
-        .returning();
+        const [upd] = await tx
+          .update(feedbackItems)
+          .set({ status: 'plan_ready', updatedAt: new Date() })
+          .where(eq(feedbackItems.id, itemId))
+          .returning();
+
+        return { planRow: plan!, sysMsg: sys!, updatedRow: upd! };
+      });
 
       const finalItem = mapPgItemToDemoShape(updatedRow!);
       const planDto = mapPgPlanToDTO(planRow!);
@@ -889,6 +976,18 @@ export async function registerFeedbackRoutes(app: FastifyInstance) {
         return reply.status(403).send({ error: 'Forbidden', message: 'Access denied.' });
       }
 
+      // Strictly enforce feedback-screenshots prefix & reporter ownership to prevent bucket IDOR
+      if (!isValidFeedbackScreenshotKey(record.item.screenshotStorageKey)) {
+        return reply.status(403).send({ error: 'ForbiddenScreenshotKey', message: 'Invalid screenshot key.' });
+      }
+      if (
+        !isAdmin &&
+        (!record.item.reporterUserId ||
+          !isOwnedFeedbackScreenshotKey(record.item.screenshotStorageKey, record.item.reporterUserId))
+      ) {
+        return reply.status(403).send({ error: 'ForbiddenScreenshotKey', message: 'Screenshot ownership mismatch.' });
+      }
+
       const demoBlob = demoStore.feedbackScreenshots.get(record.item.screenshotStorageKey);
       if (demoBlob) {
         reply.header('Content-Type', demoBlob.contentType);
@@ -946,28 +1045,50 @@ export async function registerFeedbackRoutes(app: FastifyInstance) {
         };
         demoStore.feedbackMessages.push(msg);
         record.item.updatedAt = nowIso;
+        await writeAuditLog({
+          actorUserId: request.actor.userId,
+          actorEmail: request.actor.email,
+          action: 'FEEDBACK_MESSAGE_POSTED',
+          entityType: 'feedback_item',
+          entityId: record.item.ticketKey,
+          ipAddress: request.ip,
+          afterValues: { senderType, visibleToReporter },
+        });
         return reply.status(201).send({ message: msg });
       }
 
       const db = getDb();
-      const [inserted] = await db
-        .insert(feedbackMessages)
-        .values({
-          feedbackItemId: id,
-          senderType,
-          senderUserId: isValidUuid(request.actor.userId) ? request.actor.userId : null,
-          senderName: request.actor.fullName,
-          body: redactString(parsed.data.body, 4000),
-          visibleToReporter,
-        })
-        .returning();
+      const inserted = await db.transaction(async (tx) => {
+        const [msgRow] = await tx
+          .insert(feedbackMessages)
+          .values({
+            feedbackItemId: id,
+            senderType,
+            senderUserId: isValidUuid(request.actor.userId) ? request.actor.userId : null,
+            senderName: request.actor.fullName,
+            body: redactString(parsed.data.body, 4000),
+            visibleToReporter,
+          })
+          .returning();
 
-      await db
-        .update(feedbackItems)
-        .set({ updatedAt: new Date() })
-        .where(eq(feedbackItems.id, id));
+        await tx
+          .update(feedbackItems)
+          .set({ updatedAt: new Date() })
+          .where(eq(feedbackItems.id, id));
+        return msgRow!;
+      });
 
-      return reply.status(201).send({ message: mapPgMessageToDTO(inserted!) });
+      await writeAuditLog({
+        actorUserId: request.actor.userId,
+        actorEmail: request.actor.email,
+        action: 'FEEDBACK_MESSAGE_POSTED',
+        entityType: 'feedback_item',
+        entityId: record.item.ticketKey,
+        ipAddress: request.ip,
+        afterValues: { senderType, visibleToReporter },
+      });
+
+      return reply.status(201).send({ message: mapPgMessageToDTO(inserted) });
     }
   );
 
@@ -992,7 +1113,8 @@ export async function registerFeedbackRoutes(app: FastifyInstance) {
 
       const previousPlan = [...record.plans].sort((a, b) => b.version - a.version)[0] ?? null;
       const nextVersion = (previousPlan?.version ?? 0) + 1;
-      const screenshotInline = getDemoScreenshotInline(record.item.screenshotStorageKey);
+      const screenshotInline = await getScreenshotInline(record.item.screenshotStorageKey);
+      const redactedRevisionFeedback = redactString(parsed.data.feedback, 3000);
 
       const generated = await generateFixPlan({
         ticketKey: record.item.ticketKey,
@@ -1039,7 +1161,7 @@ export async function registerFeedbackRoutes(app: FastifyInstance) {
           entityType: 'feedback_item',
           entityId: record.item.ticketKey,
           ipAddress: request.ip,
-          afterValues: { version: nextVersion, revisionFeedback: parsed.data.feedback },
+          afterValues: { version: nextVersion, revisionFeedback: redactedRevisionFeedback },
         });
 
         const updatedRecord = await loadFeedbackRecord(id);
@@ -1055,37 +1177,39 @@ export async function registerFeedbackRoutes(app: FastifyInstance) {
       }
 
       const db = getDb();
-      await db
-        .update(feedbackFixPlans)
-        .set({ status: 'superseded' })
-        .where(
-          and(
-            eq(feedbackFixPlans.feedbackItemId, id),
-            eq(feedbackFixPlans.status, 'pending_approval')
-          )
-        );
+      await db.transaction(async (tx) => {
+        await tx
+          .update(feedbackFixPlans)
+          .set({ status: 'superseded' })
+          .where(
+            and(
+              eq(feedbackFixPlans.feedbackItemId, id),
+              eq(feedbackFixPlans.status, 'pending_approval')
+            )
+          );
 
-      await db.insert(feedbackFixPlans).values({
-        feedbackItemId: id,
-        version: nextVersion,
-        modelName: generated.modelName,
-        summary: generated.plan.summary,
-        rootCauseOrGoal: generated.plan.rootCauseOrGoal,
-        affectedFilesJson: generated.plan.affectedFiles,
-        schemaChangesJson: generated.plan.schemaChanges,
-        securityRbacImpact: generated.plan.securityRbacImpact,
-        implementationStepsJson: generated.plan.implementationSteps,
-        verificationStepsJson: generated.plan.verificationSteps,
-        riskLevel: generated.plan.riskLevel,
-        estimatedEffort: generated.plan.estimatedEffort,
-        revisionFeedback: redactString(parsed.data.feedback, 3000),
-        status: 'pending_approval',
+        await tx.insert(feedbackFixPlans).values({
+          feedbackItemId: id,
+          version: nextVersion,
+          modelName: generated.modelName,
+          summary: generated.plan.summary,
+          rootCauseOrGoal: generated.plan.rootCauseOrGoal,
+          affectedFilesJson: generated.plan.affectedFiles,
+          schemaChangesJson: generated.plan.schemaChanges,
+          securityRbacImpact: generated.plan.securityRbacImpact,
+          implementationStepsJson: generated.plan.implementationSteps,
+          verificationStepsJson: generated.plan.verificationSteps,
+          riskLevel: generated.plan.riskLevel,
+          estimatedEffort: generated.plan.estimatedEffort,
+          revisionFeedback: redactedRevisionFeedback,
+          status: 'pending_approval',
+        });
+
+        await tx
+          .update(feedbackItems)
+          .set({ status: 'plan_ready', updatedAt: new Date() })
+          .where(eq(feedbackItems.id, id));
       });
-
-      await db
-        .update(feedbackItems)
-        .set({ status: 'plan_ready', updatedAt: new Date() })
-        .where(eq(feedbackItems.id, id));
 
       await writeAuditLog({
         actorUserId: request.actor.userId,
@@ -1094,7 +1218,7 @@ export async function registerFeedbackRoutes(app: FastifyInstance) {
         entityType: 'feedback_item',
         entityId: record.item.ticketKey,
         ipAddress: request.ip,
-        afterValues: { version: nextVersion, revisionFeedback: parsed.data.feedback },
+        afterValues: { version: nextVersion, revisionFeedback: redactedRevisionFeedback },
       });
 
       const updatedRecord = await loadFeedbackRecord(id);
@@ -1134,9 +1258,19 @@ export async function registerFeedbackRoutes(app: FastifyInstance) {
         return reply.status(400).send({ error: 'NoPlanAvailable', message: 'No fix plan exists to approve.' });
       }
 
-      const ghResult = parsed.data.createGithubIssue
-        ? await createApprovedFixGitHubIssue(record.item, latestPlan, record.messages)
-        : { status: 'not_dispatched' as GithubDispatchStatus, issueNumber: null, issueUrl: null };
+      // Guard against duplicate GitHub issue dispatch if already created
+      const alreadyDispatched =
+        record.item.githubDispatchStatus === 'created' && record.item.githubIssueNumber !== null;
+
+      const ghResult = alreadyDispatched
+        ? {
+            status: 'created' as GithubDispatchStatus,
+            issueNumber: record.item.githubIssueNumber,
+            issueUrl: record.item.githubIssueUrl,
+          }
+        : parsed.data.createGithubIssue
+          ? await createApprovedFixGitHubIssue(record.item, latestPlan, record.messages)
+          : { status: 'not_dispatched' as GithubDispatchStatus, issueNumber: null, issueUrl: null };
 
       const nowIso = new Date().toISOString();
       const adminNotes = parsed.data.adminNotes ? redactString(parsed.data.adminNotes, 2000) : record.item.adminNotes;
@@ -1195,32 +1329,44 @@ export async function registerFeedbackRoutes(app: FastifyInstance) {
       }
 
       const db = getDb();
-      await db
-        .update(feedbackFixPlans)
-        .set({ status: 'approved' })
-        .where(eq(feedbackFixPlans.id, latestPlan.id));
+      await db.transaction(async (tx) => {
+        await tx
+          .update(feedbackFixPlans)
+          .set({ status: 'superseded' })
+          .where(
+            and(
+              eq(feedbackFixPlans.feedbackItemId, id),
+              eq(feedbackFixPlans.status, 'pending_approval')
+            )
+          );
 
-      await db
-        .update(feedbackItems)
-        .set({
-          status: 'approved',
-          adminNotes: adminNotes ?? null,
-          approvedByUserId: isValidUuid(request.actor.userId) ? request.actor.userId : null,
-          approvedAt: new Date(),
-          updatedAt: new Date(),
-          githubDispatchStatus: ghResult.status,
-          githubIssueNumber: ghResult.issueNumber,
-          githubIssueUrl: ghResult.issueUrl,
-        })
-        .where(eq(feedbackItems.id, id));
+        await tx
+          .update(feedbackFixPlans)
+          .set({ status: 'approved' })
+          .where(eq(feedbackFixPlans.id, latestPlan.id));
 
-      await db.insert(feedbackMessages).values({
-        feedbackItemId: id,
-        senderType: 'system',
-        senderUserId: null,
-        senderName: 'System',
-        body: `Fix plan v${latestPlan.version} approved by ${request.actor.fullName} and queued for implementation.`,
-        visibleToReporter: true,
+        await tx
+          .update(feedbackItems)
+          .set({
+            status: 'approved',
+            adminNotes: adminNotes ?? null,
+            approvedByUserId: isValidUuid(request.actor.userId) ? request.actor.userId : null,
+            approvedAt: new Date(),
+            updatedAt: new Date(),
+            githubDispatchStatus: ghResult.status,
+            githubIssueNumber: ghResult.issueNumber,
+            githubIssueUrl: ghResult.issueUrl,
+          })
+          .where(eq(feedbackItems.id, id));
+
+        await tx.insert(feedbackMessages).values({
+          feedbackItemId: id,
+          senderType: 'system',
+          senderUserId: null,
+          senderName: 'System',
+          body: `Fix plan v${latestPlan.version} approved by ${request.actor.fullName} and queued for implementation.`,
+          visibleToReporter: true,
+        });
       });
 
       await writeAuditLog({
@@ -1276,6 +1422,19 @@ export async function registerFeedbackRoutes(app: FastifyInstance) {
         return reply.status(400).send({ error: 'NoPlanAvailable', message: 'No fix plan found.' });
       }
 
+      if (record.item.githubDispatchStatus === 'created' && record.item.githubIssueNumber !== null) {
+        return {
+          item: projectFeedbackItemForActor(
+            record.item,
+            record.plans,
+            record.messages,
+            request.actor,
+            true
+          ),
+          githubError: null,
+        };
+      }
+
       const ghResult = await createApprovedFixGitHubIssue(record.item, latestPlan, record.messages);
 
       if (isUsingDemoStore()) {
@@ -1295,6 +1454,19 @@ export async function registerFeedbackRoutes(app: FastifyInstance) {
           })
           .where(eq(feedbackItems.id, id));
       }
+
+      await writeAuditLog({
+        actorUserId: request.actor.userId,
+        actorEmail: request.actor.email,
+        action: 'FEEDBACK_GITHUB_RETRY',
+        entityType: 'feedback_item',
+        entityId: record.item.ticketKey,
+        ipAddress: request.ip,
+        afterValues: {
+          githubDispatchStatus: ghResult.status,
+          githubIssueNumber: ghResult.issueNumber,
+        },
+      });
 
       const updatedRecord = await loadFeedbackRecord(id);
       return {
@@ -1356,29 +1528,31 @@ export async function registerFeedbackRoutes(app: FastifyInstance) {
         });
       } else {
         const db = getDb();
-        await db
-          .update(feedbackFixPlans)
-          .set({ status: 'rejected' })
-          .where(and(eq(feedbackFixPlans.feedbackItemId, id), eq(feedbackFixPlans.status, 'pending_approval')));
+        await db.transaction(async (tx) => {
+          await tx
+            .update(feedbackFixPlans)
+            .set({ status: 'rejected' })
+            .where(and(eq(feedbackFixPlans.feedbackItemId, id), eq(feedbackFixPlans.status, 'pending_approval')));
 
-        await db
-          .update(feedbackItems)
-          .set({
-            status: 'rejected',
-            resolutionNote: note,
-            adminNotes: adminNotes ?? null,
-            resolvedAt: new Date(),
-            updatedAt: new Date(),
-          })
-          .where(eq(feedbackItems.id, id));
+          await tx
+            .update(feedbackItems)
+            .set({
+              status: 'rejected',
+              resolutionNote: note,
+              adminNotes: adminNotes ?? null,
+              resolvedAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(eq(feedbackItems.id, id));
 
-        await db.insert(feedbackMessages).values({
-          feedbackItemId: id,
-          senderType: 'admin',
-          senderUserId: isValidUuid(request.actor.userId) ? request.actor.userId : null,
-          senderName: request.actor.fullName,
-          body: note,
-          visibleToReporter: true,
+          await tx.insert(feedbackMessages).values({
+            feedbackItemId: id,
+            senderType: 'admin',
+            senderUserId: isValidUuid(request.actor.userId) ? request.actor.userId : null,
+            senderName: request.actor.fullName,
+            body: note,
+            visibleToReporter: true,
+          });
         });
       }
 
@@ -1426,6 +1600,7 @@ export async function registerFeedbackRoutes(app: FastifyInstance) {
         return reply.status(404).send({ error: 'NotFound', message: 'Feedback ticket not found.' });
       }
 
+      const prevStatus = record.item.status;
       const nextStatus = parsed.data.status;
       const nowIso = new Date().toISOString();
       const note = parsed.data.resolutionNote
@@ -1453,26 +1628,28 @@ export async function registerFeedbackRoutes(app: FastifyInstance) {
         }
       } else {
         const db = getDb();
-        await db
-          .update(feedbackItems)
-          .set({
-            status: nextStatus,
-            resolutionNote: note ?? null,
-            resolvedAt: nextStatus === 'deployed' ? new Date() : record.item.resolvedAt ? new Date(record.item.resolvedAt) : null,
-            updatedAt: new Date(),
-          })
-          .where(eq(feedbackItems.id, id));
+        await db.transaction(async (tx) => {
+          await tx
+            .update(feedbackItems)
+            .set({
+              status: nextStatus,
+              resolutionNote: note ?? null,
+              resolvedAt: nextStatus === 'deployed' ? new Date() : record.item.resolvedAt ? new Date(record.item.resolvedAt) : null,
+              updatedAt: new Date(),
+            })
+            .where(eq(feedbackItems.id, id));
 
-        if (parsed.data.resolutionNote) {
-          await db.insert(feedbackMessages).values({
-            feedbackItemId: id,
-            senderType: 'admin',
-            senderUserId: isValidUuid(request.actor.userId) ? request.actor.userId : null,
-            senderName: request.actor.fullName,
-            body: redactString(parsed.data.resolutionNote, 2000),
-            visibleToReporter: true,
-          });
-        }
+          if (parsed.data.resolutionNote) {
+            await tx.insert(feedbackMessages).values({
+              feedbackItemId: id,
+              senderType: 'admin',
+              senderUserId: isValidUuid(request.actor.userId) ? request.actor.userId : null,
+              senderName: request.actor.fullName,
+              body: redactString(parsed.data.resolutionNote, 2000),
+              visibleToReporter: true,
+            });
+          }
+        });
       }
 
       await writeAuditLog({
@@ -1482,7 +1659,7 @@ export async function registerFeedbackRoutes(app: FastifyInstance) {
         entityType: 'feedback_item',
         entityId: record.item.ticketKey,
         ipAddress: request.ip,
-        beforeValues: { status: record.item.status },
+        beforeValues: { status: prevStatus },
         afterValues: { status: nextStatus, resolutionNote: note },
       });
 

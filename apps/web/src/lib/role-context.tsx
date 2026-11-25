@@ -1,6 +1,7 @@
 'use client';
 
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import type { UserRole } from '@interstate/shared';
 
 export type AuthMode = 'demo' | 'postgres';
@@ -19,6 +20,7 @@ interface AuthMeResponse {
   authenticated?: boolean;
   mfaPending?: boolean;
   sessionTimeoutMinutes?: number;
+  message?: string;
   user?: {
     userId?: string;
     id?: string;
@@ -38,8 +40,10 @@ interface RoleContextValue {
   user: AuthUser | null;
   authenticated: boolean;
   loading: boolean;
+  authError: string | null;
   sessionTimeoutMinutes: number;
-  refreshSession: () => Promise<void>;
+  refreshSession: () => Promise<AuthUser | null>;
+  retryAuth: () => Promise<void>;
   logout: () => Promise<void>;
 }
 
@@ -49,25 +53,30 @@ const RoleContext = createContext<RoleContextValue>({
   role: 'estimator_approver',
   setRole: () => {},
   subCompanyId: DEFAULT_SUB_ID,
-  authMode: 'demo',
+  authMode: 'postgres',
   user: null,
   authenticated: false,
   loading: true,
+  authError: null,
   sessionTimeoutMinutes: 30,
-  refreshSession: async () => {},
+  refreshSession: async () => null,
+  retryAuth: async () => {},
   logout: async () => {},
 });
 
 export function RoleProvider({ children }: { children: React.ReactNode }) {
+  const router = useRouter();
   const [role, setRoleState] = useState<UserRole>('estimator_approver');
   const [subCompanyId, setSubCompanyId] = useState<string>(DEFAULT_SUB_ID);
-  const [authMode, setAuthMode] = useState<AuthMode>('demo');
+  const [authMode, setAuthMode] = useState<AuthMode>('postgres');
   const [user, setUser] = useState<AuthUser | null>(null);
   const [authenticated, setAuthenticated] = useState<boolean>(false);
   const [loading, setLoading] = useState<boolean>(true);
+  const [authError, setAuthError] = useState<string | null>(null);
   const [sessionTimeoutMinutes, setSessionTimeoutMinutes] = useState<number>(30);
 
-  const refreshSession = useCallback(async () => {
+  const refreshSession = useCallback(async (): Promise<AuthUser | null> => {
+    setAuthError(null);
     try {
       const res = await fetch('/api/auth/me', {
         method: 'GET',
@@ -83,16 +92,23 @@ export function RoleProvider({ children }: { children: React.ReactNode }) {
         setAuthMode('postgres');
         setUser(null);
         setAuthenticated(false);
-        return;
+        setAuthError(null);
+        return null;
       }
 
       if (!res.ok) {
-        // Keep demo fallback if API is temporarily unavailable during local preview
-        return;
+        const errData = (await res.json().catch(() => ({}))) as { message?: string };
+        setUser(null);
+        setAuthenticated(false);
+        setAuthError(
+          errData.message ??
+            `Authentication service returned HTTP ${res.status}. Please retry in a moment.`
+        );
+        return null;
       }
 
       const data = (await res.json()) as AuthMeResponse;
-      const detectedMode: AuthMode = data.mode === 'postgres' ? 'postgres' : 'demo';
+      const detectedMode: AuthMode = data.mode === 'demo' ? 'demo' : 'postgres';
       setAuthMode(detectedMode);
 
       if (typeof data.sessionTimeoutMinutes === 'number') {
@@ -121,22 +137,51 @@ export function RoleProvider({ children }: { children: React.ReactNode }) {
           setRoleState(validUser.role);
           setSubCompanyId(validUser.subCompanyId ?? DEFAULT_SUB_ID);
         }
-      } else {
-        setUser(validUser);
-        setAuthenticated(true);
+        return isAuthed ? validUser : null;
       }
+
+      setUser(validUser);
+      setAuthenticated(true);
+      return validUser;
     } catch {
-      // Network error during local dev without API server — stay in demo mode
+      setUser(null);
+      setAuthenticated(false);
+      setAuthError(
+        'Unable to reach the Interstate Homes authentication service. Check your connection and try again.'
+      );
+      return null;
     } finally {
       setLoading(false);
     }
   }, [role, subCompanyId]);
+
+  const retryAuth = useCallback(async () => {
+    setLoading(true);
+    setAuthError(null);
+    await refreshSession();
+  }, [refreshSession]);
 
   useEffect(() => {
     void refreshSession();
     // Only run initial mount check; subsequent updates call refreshSession explicitly.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    const handleSessionExpired = () => {
+      setAuthMode('postgres');
+      setUser(null);
+      setAuthenticated(false);
+      setAuthError(null);
+      setLoading(false);
+      if (typeof window !== 'undefined' && !window.location.pathname.startsWith('/login')) {
+        router.replace('/login');
+      }
+    };
+
+    window.addEventListener('interstate:session-expired', handleSessionExpired);
+    return () => window.removeEventListener('interstate:session-expired', handleSessionExpired);
+  }, [router]);
 
   const setRole = useCallback(
     (nextRole: UserRole) => {
@@ -157,6 +202,7 @@ export function RoleProvider({ children }: { children: React.ReactNode }) {
     } finally {
       setUser(null);
       setAuthenticated(false);
+      setAuthError(null);
     }
   }, []);
 
@@ -170,8 +216,10 @@ export function RoleProvider({ children }: { children: React.ReactNode }) {
         user,
         authenticated,
         loading,
+        authError,
         sessionTimeoutMinutes,
         refreshSession,
+        retryAuth,
         logout,
       }}
     >

@@ -124,7 +124,7 @@ export interface GitHubDispatchResult {
 }
 
 /**
- * Dispatches an approved fix plan to GitHub Issues on MCDesignCO/InterstateHomes.
+ * Dispatches an approved fix plan to GitHub Issues on mcevesfam/InterstateHomes.
  * Degrades cleanly to `not_configured` when GITHUB_TOKEN is unset.
  */
 export async function createApprovedFixGitHubIssue(
@@ -137,7 +137,7 @@ export async function createApprovedFixGitHubIssue(
     return { status: 'not_configured', issueNumber: null, issueUrl: null };
   }
 
-  const repoSlug = (process.env.GITHUB_REPO ?? 'MCDesignCO/InterstateHomes').trim();
+  const repoSlug = (process.env.GITHUB_REPO ?? 'mcevesfam/InterstateHomes').trim();
   const [owner, repo] = repoSlug.split('/');
   if (!owner || !repo) {
     return {

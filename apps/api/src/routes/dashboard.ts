@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { asc, desc, eq } from 'drizzle-orm';
 import {
+  COST_CODE_MAP,
   DEFAULT_SYSTEM_SETTINGS,
   INTERNAL_ONLY_COST_CODES,
   canAccess,
@@ -22,12 +23,36 @@ import {
   quoteRounds,
   quotes,
   subCompanies,
+  subCostCodes,
   subdivisions,
   systemSettings,
   users,
 } from '../db/schema/index.js';
 import { isUsingDemoStore } from '../security/auth-plugin.js';
 import { isValidUuid } from '../security/audit.js';
+
+function subRequiresUtahLicense(companyType: string, codesServed: string[]): boolean {
+  if (companyType === 'supplier') return false;
+  if (codesServed.length === 0) return false;
+  return codesServed.some((code) => COST_CODE_MAP.get(code)?.requiresUtahLicense === true);
+}
+
+function emptySubDashboard(role: string) {
+  return {
+    role,
+    kpis: {
+      activeHomes: 0,
+      quotesOut: 0,
+      countersToReview: 0,
+      posAwaitingSign: 0,
+      complianceAlerts: 0,
+      openClarifications: 0,
+    },
+    needsAttention: [],
+    activeHomes: [],
+    pipeline: [],
+  };
+}
 
 export async function registerDashboardRoutes(app: FastifyInstance) {
   app.get(
@@ -38,23 +63,46 @@ export async function registerDashboardRoutes(app: FastifyInstance) {
         summary: 'Role-scoped KPIs, Needs Attention feed, Active Homes, and Homes Pipeline',
       },
     },
-    async (request) => {
+    async (request, reply) => {
       const role = request.actor.role;
+      if (role === 'homeowner') {
+        return reply.status(403).send({ error: 'Forbidden' });
+      }
       const canSeeInternal = canAccess(role, 'financials:view_internal');
 
       if (isUsingDemoStore()) {
-        if (role === 'subcontractor' && request.actor.subCompanyId) {
+        if (role === 'subcontractor') {
           const subId = request.actor.subCompanyId;
-          const myQuotes = demoStore.quotes.filter((q) => q.subCompanyId === subId);
-          const myPos = demoStore.purchaseOrders.filter((p) => p.subCompanyId === subId);
+          if (!subId) return emptySubDashboard(role);
+
+          const myQuotes = demoStore.quotes.filter(
+            (q) => q.subCompanyId === subId && !INTERNAL_ONLY_COST_CODES.has(q.costCode)
+          );
+          const myPos = demoStore.purchaseOrders.filter(
+            (p) => p.subCompanyId === subId && !INTERNAL_ONLY_COST_CODES.has(p.costCode)
+          );
           const mySub = demoStore.subcontractors.find((s) => s.id === subId);
+          const assignedPairs = new Set<string>([
+            ...myQuotes.map((q) => `${q.homeId}:${q.costCode}`),
+            ...myPos.map((p) => `${p.homeId}:${p.costCode}`),
+          ]);
+          const myOpenClars = demoStore.clarifications.filter(
+            (c) =>
+              c.status === 'open' &&
+              !INTERNAL_ONLY_COST_CODES.has(c.costCode) &&
+              assignedPairs.has(`${c.homeId}:${c.costCode}`)
+          );
+
           const compliance = mySub
             ? checkSubComplianceForPO(
                 { status: mySub.status, hasVehiclesOnSite: mySub.hasVehiclesOnSite },
                 mySub.complianceDocs,
                 {
                   poType: mySub.companyType === 'supplier' ? 'supplier' : 'subcontractor',
-                  requiresUtahLicense: true,
+                  requiresUtahLicense: subRequiresUtahLicense(
+                    mySub.companyType,
+                    mySub.costCodesServed
+                  ),
                   minGlLimitCents: demoStore.settings.defaultGlMinLimitCents,
                   minAutoLimitCents: demoStore.settings.defaultAutoMinLimitCents,
                   requireMasterAgreement: demoStore.settings.requireMasterAgreement,
@@ -72,7 +120,7 @@ export async function registerDashboardRoutes(app: FastifyInstance) {
               countersToReview: myQuotes.filter((q) => q.status === 'sub_adjusted').length,
               posAwaitingSign: myPos.filter((p) => p.status === 'pending_sub_signature').length,
               complianceAlerts: compliance.blockingReasons.length,
-              openClarifications: demoStore.clarifications.filter((c) => c.status === 'open').length,
+              openClarifications: myOpenClars.length,
             },
             needsAttention: [
               ...myQuotes
@@ -116,7 +164,7 @@ export async function registerDashboardRoutes(app: FastifyInstance) {
             sub.complianceDocs,
             {
               poType: sub.companyType === 'supplier' ? 'supplier' : 'subcontractor',
-              requiresUtahLicense: sub.companyType !== 'supplier',
+              requiresUtahLicense: subRequiresUtahLicense(sub.companyType, sub.costCodesServed),
               minGlLimitCents: demoStore.settings.defaultGlMinLimitCents,
               minAutoLimitCents: demoStore.settings.defaultAutoMinLimitCents,
               requireMasterAgreement: demoStore.settings.requireMasterAgreement,
@@ -136,7 +184,11 @@ export async function registerDashboardRoutes(app: FastifyInstance) {
         }
 
         const counterAlerts = demoStore.quotes
-          .filter((q) => q.status === 'sub_adjusted')
+          .filter(
+            (q) =>
+              q.status === 'sub_adjusted' &&
+              (canSeeInternal || !INTERNAL_ONLY_COST_CODES.has(q.costCode))
+          )
           .map((q) => {
             const latest = q.rounds[q.rounds.length - 1];
             return {
@@ -150,7 +202,11 @@ export async function registerDashboardRoutes(app: FastifyInstance) {
           });
 
         const poAlerts = demoStore.purchaseOrders
-          .filter((p) => p.status === 'pending_approver_signature')
+          .filter(
+            (p) =>
+              p.status === 'pending_approver_signature' &&
+              (canSeeInternal || !INTERNAL_ONLY_COST_CODES.has(p.costCode))
+          )
           .map((p) => ({
             id: `po-${p.id}`,
             badge: 'SIGN PO',
@@ -161,7 +217,11 @@ export async function registerDashboardRoutes(app: FastifyInstance) {
           }));
 
         const clarAlerts = demoStore.clarifications
-          .filter((c) => c.status === 'open')
+          .filter(
+            (c) =>
+              c.status === 'open' &&
+              (canSeeInternal || !INTERNAL_ONLY_COST_CODES.has(c.costCode))
+          )
           .map((c) => ({
             id: `clr-${c.id}`,
             badge: 'CLARIFY',
@@ -233,11 +293,152 @@ export async function registerDashboardRoutes(app: FastifyInstance) {
 
       // Postgres mode
       const db = getDb();
+
+      // Subcontractor role NEVER falls through to internal executive dashboard
+      if (role === 'subcontractor') {
+        if (!isValidUuid(request.actor.subCompanyId)) {
+          return emptySubDashboard(role);
+        }
+        const subId = request.actor.subCompanyId;
+        const [
+          [mySub],
+          myDocs,
+          mySubCodes,
+          myQuotes,
+          myPos,
+          clarRows,
+          homeRows,
+          codeRows,
+          [settingsRow],
+        ] = await Promise.all([
+          db.select().from(subCompanies).where(eq(subCompanies.id, subId)).limit(1),
+          db
+            .select()
+            .from(complianceDocuments)
+            .where(eq(complianceDocuments.subCompanyId, subId))
+            .orderBy(desc(complianceDocuments.receivedAt)),
+          db.select().from(subCostCodes).where(eq(subCostCodes.subCompanyId, subId)),
+          db
+            .select()
+            .from(quotes)
+            .where(eq(quotes.subCompanyId, subId))
+            .orderBy(desc(quotes.sentAt)),
+          db
+            .select()
+            .from(purchaseOrders)
+            .where(eq(purchaseOrders.subCompanyId, subId))
+            .orderBy(desc(purchaseOrders.createdAt)),
+          db.select().from(clarificationItems),
+          db.select({ id: homes.id, homeCode: homes.homeCode }).from(homes),
+          db.select({ code: costCodes.code, name: costCodes.name }).from(costCodes),
+          db.select().from(systemSettings).where(eq(systemSettings.id, 'default')).limit(1),
+        ]);
+
+        const minGlLimitCents =
+          settingsRow?.defaultGlMinLimitCents ?? DEFAULT_SYSTEM_SETTINGS.defaultGlMinLimitCents;
+        const minAutoLimitCents =
+          settingsRow?.defaultAutoMinLimitCents ?? DEFAULT_SYSTEM_SETTINGS.defaultAutoMinLimitCents;
+        const requireMasterAgreement =
+          settingsRow?.requireMasterAgreement ?? DEFAULT_SYSTEM_SETTINGS.requireMasterAgreement;
+        const currentMasterAgreementVersion =
+          settingsRow?.currentMasterAgreementVersion ??
+          DEFAULT_SYSTEM_SETTINGS.currentMasterAgreementVersion;
+
+        const homeCodeMap = new Map(homeRows.map((h) => [h.id, h.homeCode]));
+        const codeNameMap = new Map(codeRows.map((c) => [c.code, c.name]));
+
+        const visibleQuotes = myQuotes.filter((q) => !INTERNAL_ONLY_COST_CODES.has(q.costCode));
+        const visiblePos = myPos.filter((p) => !INTERNAL_ONLY_COST_CODES.has(p.costCode));
+        const assignedPairs = new Set<string>([
+          ...visibleQuotes.map((q) => `${q.homeId}:${q.costCode}`),
+          ...visiblePos.map((p) => `${p.homeId}:${p.costCode}`),
+        ]);
+        const myOpenClars = clarRows.filter(
+          (c) =>
+            c.status === 'open' &&
+            !INTERNAL_ONLY_COST_CODES.has(c.costCode) &&
+            assignedPairs.has(`${c.homeId}:${c.costCode}`)
+        );
+
+        const mappedDocs: ComplianceDocRecord[] = myDocs.map((doc) => ({
+          id: doc.id,
+          fileName: doc.fileName,
+          docType: doc.docType as ComplianceDocType,
+          reviewStatus: doc.reviewStatus as 'pending' | 'approved' | 'rejected',
+          expiresAt: doc.expiresAt ?? null,
+          limitAmountCents: doc.limitAmountCents ?? null,
+          additionalInsured: doc.additionalInsured ?? false,
+          licenseClassification: doc.licenseClassification ?? null,
+          agreementVersion: doc.agreementVersion ?? null,
+        }));
+
+        const compliance = mySub
+          ? checkSubComplianceForPO(
+              {
+                status: mySub.status as 'active' | 'on_hold' | 'inactive',
+                hasVehiclesOnSite: mySub.hasVehiclesOnSite,
+              },
+              mappedDocs,
+              {
+                poType: mySub.companyType === 'supplier' ? 'supplier' : 'subcontractor',
+                requiresUtahLicense: subRequiresUtahLicense(
+                  mySub.companyType,
+                  mySubCodes.map((sc) => sc.costCode)
+                ),
+                minGlLimitCents,
+                minAutoLimitCents,
+                requireMasterAgreement,
+                currentMasterAgreementVersion,
+              }
+            )
+          : { eligible: true, blockingReasons: [] };
+
+        return {
+          role,
+          kpis: {
+            activeHomes: new Set([
+              ...visibleQuotes.map((q) => q.homeId),
+              ...visiblePos.map((p) => p.homeId),
+            ]).size,
+            quotesOut: visibleQuotes.filter((q) => q.status === 'sent').length,
+            countersToReview: visibleQuotes.filter((q) => q.status === 'sub_adjusted').length,
+            posAwaitingSign: visiblePos.filter((p) => p.status === 'pending_sub_signature').length,
+            complianceAlerts: compliance.blockingReasons.length,
+            openClarifications: myOpenClars.length,
+          },
+          needsAttention: [
+            ...visibleQuotes
+              .filter((q) => q.status === 'sent')
+              .map((q) => ({
+                id: q.id,
+                badge: 'QUOTE',
+                severity: 'blue',
+                title: `${homeCodeMap.get(q.homeId) ?? q.homeId} — ${q.costCode} ${codeNameMap.get(q.costCode) ?? q.costCode} quote awaiting response`,
+                subtitle: `Deadline ${q.responseDeadline} · $${(q.quotedTotalCents / 100).toLocaleString()}`,
+                href: '/quotes',
+              })),
+            ...visiblePos
+              .filter((p) => p.status === 'pending_sub_signature')
+              .map((p) => ({
+                id: p.id,
+                badge: 'SIGN PO',
+                severity: 'amber',
+                title: `${p.poNumber} ready for subcontractor e-signature`,
+                subtitle: `${homeCodeMap.get(p.homeId) ?? p.homeId} · ${p.scopeSummary}`,
+                href: '/purchase-orders',
+              })),
+          ],
+          activeHomes: [],
+          pipeline: [],
+        };
+      }
+
       const [
         homeRows,
         subdivisionRows,
         revRows,
         subRows,
+        subCodeRows,
         docRows,
         quoteRows,
         roundRows,
@@ -253,6 +454,7 @@ export async function registerDashboardRoutes(app: FastifyInstance) {
         db.select().from(subdivisions),
         db.select().from(homePlanRevisions).orderBy(desc(homePlanRevisions.uploadedAt)),
         db.select().from(subCompanies),
+        db.select().from(subCostCodes),
         db.select().from(complianceDocuments).orderBy(desc(complianceDocuments.receivedAt)),
         db.select().from(quotes).orderBy(desc(quotes.sentAt)),
         db.select().from(quoteRounds).orderBy(asc(quoteRounds.roundNumber)),
@@ -281,10 +483,19 @@ export async function registerDashboardRoutes(app: FastifyInstance) {
       const codeNameMap = new Map(codeRows.map((c) => [c.code, c.name]));
       const userNameMap = new Map(userRows.map((u) => [u.id, u.fullName]));
 
+      const codesBySub = new Map<string, string[]>();
+      for (const link of subCodeRows) {
+        const list = codesBySub.get(link.subCompanyId) ?? [];
+        list.push(link.costCode);
+        codesBySub.set(link.subCompanyId, list);
+      }
+
       const docsBySub = new Map<string, ComplianceDocRecord[]>();
       for (const doc of docRows) {
         const list = docsBySub.get(doc.subCompanyId) ?? [];
         list.push({
+          id: doc.id,
+          fileName: doc.fileName,
           docType: doc.docType as ComplianceDocType,
           reviewStatus: doc.reviewStatus as 'pending' | 'approved' | 'rejected',
           expiresAt: doc.expiresAt ?? null,
@@ -294,69 +505,6 @@ export async function registerDashboardRoutes(app: FastifyInstance) {
           agreementVersion: doc.agreementVersion ?? null,
         });
         docsBySub.set(doc.subCompanyId, list);
-      }
-
-      if (role === 'subcontractor' && isValidUuid(request.actor.subCompanyId)) {
-        const subId = request.actor.subCompanyId;
-        const myQuotes = quoteRows.filter((q) => q.subCompanyId === subId);
-        const myPos = poRows.filter((p) => p.subCompanyId === subId);
-        const mySub = subRows.find((s) => s.id === subId);
-        const compliance = mySub
-          ? checkSubComplianceForPO(
-              {
-                status: mySub.status as 'active' | 'on_hold' | 'inactive',
-                hasVehiclesOnSite: mySub.hasVehiclesOnSite,
-              },
-              docsBySub.get(subId) ?? [],
-              {
-                poType: mySub.companyType === 'supplier' ? 'supplier' : 'subcontractor',
-                requiresUtahLicense: true,
-                minGlLimitCents,
-                minAutoLimitCents,
-                requireMasterAgreement,
-                currentMasterAgreementVersion,
-              }
-            )
-          : { eligible: true, blockingReasons: [] };
-
-        return {
-          role,
-          kpis: {
-            activeHomes: new Set([
-              ...myQuotes.map((q) => q.homeId),
-              ...myPos.map((p) => p.homeId),
-            ]).size,
-            quotesOut: myQuotes.filter((q) => q.status === 'sent').length,
-            countersToReview: myQuotes.filter((q) => q.status === 'sub_adjusted').length,
-            posAwaitingSign: myPos.filter((p) => p.status === 'pending_sub_signature').length,
-            complianceAlerts: compliance.blockingReasons.length,
-            openClarifications: clarRows.filter((c) => c.status === 'open').length,
-          },
-          needsAttention: [
-            ...myQuotes
-              .filter((q) => q.status === 'sent')
-              .map((q) => ({
-                id: q.id,
-                badge: 'QUOTE',
-                severity: 'blue',
-                title: `${homeCodeMap.get(q.homeId) ?? q.homeId} — ${q.costCode} ${codeNameMap.get(q.costCode) ?? q.costCode} quote awaiting response`,
-                subtitle: `Deadline ${q.responseDeadline} · $${(q.quotedTotalCents / 100).toLocaleString()}`,
-                href: '/quotes',
-              })),
-            ...myPos
-              .filter((p) => p.status === 'pending_sub_signature')
-              .map((p) => ({
-                id: p.id,
-                badge: 'SIGN PO',
-                severity: 'amber',
-                title: `${p.poNumber} ready for subcontractor e-signature`,
-                subtitle: `${homeCodeMap.get(p.homeId) ?? p.homeId} · ${p.scopeSummary}`,
-                href: '/purchase-orders',
-              })),
-          ],
-          activeHomes: [],
-          pipeline: [],
-        };
       }
 
       const complianceAlerts: Array<{
@@ -377,7 +525,10 @@ export async function registerDashboardRoutes(app: FastifyInstance) {
           docsBySub.get(sub.id) ?? [],
           {
             poType: sub.companyType === 'supplier' ? 'supplier' : 'subcontractor',
-            requiresUtahLicense: sub.companyType !== 'supplier',
+            requiresUtahLicense: subRequiresUtahLicense(
+              sub.companyType,
+              codesBySub.get(sub.id) ?? []
+            ),
             minGlLimitCents,
             minAutoLimitCents,
             requireMasterAgreement,
@@ -402,7 +553,11 @@ export async function registerDashboardRoutes(app: FastifyInstance) {
       }
 
       const counterAlerts = quoteRows
-        .filter((q) => q.status === 'sub_adjusted')
+        .filter(
+          (q) =>
+            q.status === 'sub_adjusted' &&
+            (canSeeInternal || !INTERNAL_ONLY_COST_CODES.has(q.costCode))
+        )
         .map((q) => {
           const latest = latestRoundByQuote.get(q.id);
           return {
@@ -416,7 +571,11 @@ export async function registerDashboardRoutes(app: FastifyInstance) {
         });
 
       const poAlerts = poRows
-        .filter((p) => p.status === 'pending_approver_signature')
+        .filter(
+          (p) =>
+            p.status === 'pending_approver_signature' &&
+            (canSeeInternal || !INTERNAL_ONLY_COST_CODES.has(p.costCode))
+        )
         .map((p) => ({
           id: `po-${p.id}`,
           badge: 'SIGN PO',
@@ -427,7 +586,10 @@ export async function registerDashboardRoutes(app: FastifyInstance) {
         }));
 
       const clarAlerts = clarRows
-        .filter((c) => c.status === 'open')
+        .filter(
+          (c) =>
+            c.status === 'open' && (canSeeInternal || !INTERNAL_ONLY_COST_CODES.has(c.costCode))
+        )
         .map((c) => ({
           id: `clr-${c.id}`,
           badge: 'CLARIFY',

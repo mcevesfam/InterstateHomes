@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { asc, desc, eq } from 'drizzle-orm';
+import { asc, desc, eq, inArray } from 'drizzle-orm';
 import { COST_CODES, canAccess, createHomeSchema } from '@interstate/shared';
 import { demoStore } from '../data/demo-store.js';
 import { getDb } from '../db/client.js';
@@ -10,18 +10,33 @@ import {
   homePlanRevisions,
   homes,
   planLibraryQuantities,
+  purchaseOrders,
+  quotes,
   subdivisions,
 } from '../db/schema/index.js';
 import { isUsingDemoStore, requirePermission } from '../security/auth-plugin.js';
 import { isValidUuid, writeAuditLog } from '../security/audit.js';
 
 export async function registerHomesRoutes(app: FastifyInstance) {
-  app.get('/api/homes', { schema: { tags: ['Homes & Plans'] } }, async (request) => {
+  app.get('/api/homes', { schema: { tags: ['Homes & Plans'] } }, async (request, reply) => {
+    if (request.actor.role === 'homeowner') {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
     const canSeeInternal = canAccess(request.actor.role, 'financials:view_internal');
 
     if (isUsingDemoStore()) {
+      let visibleHomes = demoStore.homes;
+      if (request.actor.role === 'subcontractor') {
+        const subId = request.actor.subCompanyId;
+        if (!subId) return { homes: [] };
+        const allowedHomeIds = new Set<string>([
+          ...demoStore.quotes.filter((q) => q.subCompanyId === subId).map((q) => q.homeId),
+          ...demoStore.purchaseOrders.filter((p) => p.subCompanyId === subId).map((p) => p.homeId),
+        ]);
+        visibleHomes = demoStore.homes.filter((h) => allowedHomeIds.has(h.id));
+      }
       return {
-        homes: demoStore.homes.map((h) => ({
+        homes: visibleHomes.map((h) => ({
           ...h,
           soldAmountCents: canSeeInternal ? h.soldAmountCents : null,
         })),
@@ -29,8 +44,37 @@ export async function registerHomesRoutes(app: FastifyInstance) {
     }
 
     const db = getDb();
+    let allowedHomeIds: string[] | null = null;
+    if (request.actor.role === 'subcontractor') {
+      if (!isValidUuid(request.actor.subCompanyId)) {
+        return { homes: [] };
+      }
+      const [subQuotes, subPos] = await Promise.all([
+        db
+          .select({ homeId: quotes.homeId })
+          .from(quotes)
+          .where(eq(quotes.subCompanyId, request.actor.subCompanyId)),
+        db
+          .select({ homeId: purchaseOrders.homeId })
+          .from(purchaseOrders)
+          .where(eq(purchaseOrders.subCompanyId, request.actor.subCompanyId)),
+      ]);
+      allowedHomeIds = Array.from(
+        new Set([...subQuotes.map((q) => q.homeId), ...subPos.map((p) => p.homeId)])
+      );
+      if (allowedHomeIds.length === 0) {
+        return { homes: [] };
+      }
+    }
+
     const [homeRows, subRows, revRows] = await Promise.all([
-      db.select().from(homes).orderBy(desc(homes.createdAt)),
+      allowedHomeIds
+        ? db
+            .select()
+            .from(homes)
+            .where(inArray(homes.id, allowedHomeIds))
+            .orderBy(desc(homes.createdAt))
+        : db.select().from(homes).orderBy(desc(homes.createdAt)),
       db.select().from(subdivisions),
       db.select().from(homePlanRevisions).orderBy(desc(homePlanRevisions.uploadedAt)),
     ]);
@@ -70,12 +114,27 @@ export async function registerHomesRoutes(app: FastifyInstance) {
   });
 
   app.get('/api/homes/:id', { schema: { tags: ['Homes & Plans'] } }, async (request, reply) => {
+    if (request.actor.role === 'homeowner') {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
     const { id } = request.params as { id: string };
     const canSeeInternal = canAccess(request.actor.role, 'financials:view_internal');
 
     if (isUsingDemoStore()) {
       const home = demoStore.homes.find((h) => h.id === id);
       if (!home) return reply.status(404).send({ error: 'HomeNotFound' });
+
+      if (request.actor.role === 'subcontractor') {
+        const subId = request.actor.subCompanyId;
+        const assigned =
+          Boolean(subId) &&
+          (demoStore.quotes.some((q) => q.homeId === id && q.subCompanyId === subId) ||
+            demoStore.purchaseOrders.some((p) => p.homeId === id && p.subCompanyId === subId));
+        if (!assigned) {
+          return reply.status(403).send({ error: 'Forbidden' });
+        }
+      }
+
       return {
         home: {
           ...home,
@@ -91,6 +150,52 @@ export async function registerHomesRoutes(app: FastifyInstance) {
     const db = getDb();
     const [home] = await db.select().from(homes).where(eq(homes.id, id)).limit(1);
     if (!home) return reply.status(404).send({ error: 'HomeNotFound' });
+
+    if (request.actor.role === 'subcontractor') {
+      if (!isValidUuid(request.actor.subCompanyId)) {
+        return reply.status(403).send({ error: 'Forbidden' });
+      }
+      const [subQuotes, subPos] = await Promise.all([
+        db
+          .select({ id: quotes.id })
+          .from(quotes)
+          .where(eq(quotes.subCompanyId, request.actor.subCompanyId)),
+        db
+          .select({ id: purchaseOrders.id })
+          .from(purchaseOrders)
+          .where(eq(purchaseOrders.subCompanyId, request.actor.subCompanyId)),
+      ]);
+      const [matchingQ, matchingP] = await Promise.all([
+        subQuotes.length > 0
+          ? db.select({ homeId: quotes.homeId }).from(quotes).where(eq(quotes.homeId, id))
+          : Promise.resolve([]),
+        subPos.length > 0
+          ? db
+              .select({ homeId: purchaseOrders.homeId })
+              .from(purchaseOrders)
+              .where(eq(purchaseOrders.homeId, id))
+          : Promise.resolve([]),
+      ]);
+      // Verify exact (homeId, subCompanyId) link
+      const [exactQ, exactP] = await Promise.all([
+        db
+          .select({ id: quotes.id })
+          .from(quotes)
+          .where(eq(quotes.homeId, id)),
+        db
+          .select({ id: purchaseOrders.id })
+          .from(purchaseOrders)
+          .where(eq(purchaseOrders.homeId, id)),
+      ]);
+      const subQuoteIds = new Set(subQuotes.map((q) => q.id));
+      const subPoIds = new Set(subPos.map((p) => p.id));
+      const assigned =
+        (matchingQ.length > 0 && exactQ.some((q) => subQuoteIds.has(q.id))) ||
+        (matchingP.length > 0 && exactP.some((p) => subPoIds.has(p.id)));
+      if (!assigned) {
+        return reply.status(403).send({ error: 'Forbidden' });
+      }
+    }
 
     const [[sub], [latestRev]] = await Promise.all([
       db

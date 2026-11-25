@@ -3,7 +3,10 @@ import { asc, desc, eq } from 'drizzle-orm';
 import { z } from 'zod';
 import {
   COST_CODE_MAP,
+  INTERNAL_ONLY_COST_CODES,
+  canAccess,
   costCodeTextSchema,
+  isoDateSchema,
   quoteCounterSchema,
   quoteDecisionSchema,
 } from '@interstate/shared';
@@ -24,7 +27,7 @@ const createQuoteSchema = z.object({
   homeId: z.string().min(1),
   subCompanyId: z.string().min(1),
   costCode: costCodeTextSchema,
-  responseDeadline: z.string().min(8).max(20),
+  responseDeadline: isoDateSchema,
   quotedTotalCents: z.number().int().nonnegative(),
   proposedQuantity: z.number().nonnegative().optional(),
   comment: z.string().max(1000).default('Initial quote sent from estimate.'),
@@ -70,12 +73,26 @@ async function loadPostgresQuoteById(id: string) {
 }
 
 export async function registerQuoteRoutes(app: FastifyInstance) {
-  app.get('/api/quotes', { schema: { tags: ['Quotes'] } }, async (request) => {
+  app.get('/api/quotes', { schema: { tags: ['Quotes'] } }, async (request, reply) => {
+    if (request.actor.role === 'homeowner') {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
+    const canSeeInternal = canAccess(request.actor.role, 'financials:view_internal');
+
     if (isUsingDemoStore()) {
-      const list =
-        request.actor.role === 'subcontractor' && request.actor.subCompanyId
-          ? demoStore.quotes.filter((q) => q.subCompanyId === request.actor.subCompanyId)
-          : demoStore.quotes;
+      if (request.actor.role === 'subcontractor') {
+        if (!request.actor.subCompanyId) return { quotes: [] };
+        return {
+          quotes: demoStore.quotes.filter(
+            (q) =>
+              q.subCompanyId === request.actor.subCompanyId &&
+              !INTERNAL_ONLY_COST_CODES.has(q.costCode)
+          ),
+        };
+      }
+      const list = demoStore.quotes.filter(
+        (q) => canSeeInternal || !INTERNAL_ONLY_COST_CODES.has(q.costCode)
+      );
       return { quotes: list };
     }
 
@@ -130,8 +147,12 @@ export async function registerQuoteRoutes(app: FastifyInstance) {
       roundsByQuote.set(r.quoteId, list);
     }
 
+    const visibleQuotes = quoteRows.filter(
+      (q) => canSeeInternal || !INTERNAL_ONLY_COST_CODES.has(q.costCode)
+    );
+
     return {
-      quotes: quoteRows.map((q) => ({
+      quotes: visibleQuotes.map((q) => ({
         id: q.id,
         homeId: q.homeId,
         homeCode: homeMap.get(q.homeId) ?? q.homeId,
@@ -159,6 +180,13 @@ export async function registerQuoteRoutes(app: FastifyInstance) {
         return reply.status(400).send({ error: 'ValidationError', details: parsed.error.flatten() });
       }
       const d = parsed.data;
+
+      if (d.costCode === '00' || INTERNAL_ONLY_COST_CODES.has(d.costCode)) {
+        return reply.status(400).send({
+          error: 'InvalidCostCode',
+          message: `Cost code "${d.costCode}" cannot be sent to subcontractors as a quote.`,
+        });
+      }
 
       if (isUsingDemoStore()) {
         const home = demoStore.homes.find((h) => h.id === d.homeId);
@@ -279,7 +307,10 @@ export async function registerQuoteRoutes(app: FastifyInstance) {
 
   app.post(
     '/api/quotes/:id/counter',
-    { schema: { tags: ['Quotes'], summary: 'Subcontractor adjusts quote price or quantity (Rule 3)' } },
+    {
+      preHandler: [requirePermission('quotes:respond_own')],
+      schema: { tags: ['Quotes'], summary: 'Subcontractor adjusts quote price or quantity (Rule 3)' },
+    },
     async (request, reply) => {
       const { id } = request.params as { id: string };
       const parsed = quoteCounterSchema.safeParse(request.body);
@@ -287,15 +318,22 @@ export async function registerQuoteRoutes(app: FastifyInstance) {
         return reply.status(400).send({ error: 'ValidationError', details: parsed.error.flatten() });
       }
 
+      if (!request.actor.subCompanyId) {
+        return reply.status(403).send({ error: 'Forbidden', message: 'Subcontractor company link required.' });
+      }
+
       if (isUsingDemoStore()) {
         const quote = demoStore.quotes.find((q) => q.id === id);
         if (!quote) return reply.status(404).send({ error: 'QuoteNotFound' });
 
-        if (
-          request.actor.role === 'subcontractor' &&
-          quote.subCompanyId !== request.actor.subCompanyId
-        ) {
+        if (quote.subCompanyId !== request.actor.subCompanyId) {
           return reply.status(403).send({ error: 'Forbidden' });
+        }
+        if (quote.status !== 'sent') {
+          return reply.status(409).send({
+            error: 'InvalidQuoteState',
+            message: `Cannot counter a quote with status "${quote.status}". Only sent quotes can be adjusted.`,
+          });
         }
 
         const prevTotal = quote.quotedTotalCents;
@@ -332,11 +370,14 @@ export async function registerQuoteRoutes(app: FastifyInstance) {
       const [quote] = await db.select().from(quotes).where(eq(quotes.id, id)).limit(1);
       if (!quote) return reply.status(404).send({ error: 'QuoteNotFound' });
 
-      if (
-        request.actor.role === 'subcontractor' &&
-        quote.subCompanyId !== request.actor.subCompanyId
-      ) {
+      if (quote.subCompanyId !== request.actor.subCompanyId) {
         return reply.status(403).send({ error: 'Forbidden' });
+      }
+      if (quote.status !== 'sent') {
+        return reply.status(409).send({
+          error: 'InvalidQuoteState',
+          message: `Cannot counter a quote with status "${quote.status}". Only sent quotes can be adjusted.`,
+        });
       }
 
       const existingRounds = await db
@@ -388,6 +429,110 @@ export async function registerQuoteRoutes(app: FastifyInstance) {
   );
 
   app.post(
+    '/api/quotes/:id/accept',
+    {
+      preHandler: [requirePermission('quotes:respond_own')],
+      schema: { tags: ['Quotes'], summary: 'Subcontractor accepts a sent quote as-is' },
+    },
+    async (request, reply) => {
+      const { id } = request.params as { id: string };
+      if (!request.actor.subCompanyId) {
+        return reply.status(403).send({ error: 'Forbidden', message: 'Subcontractor company link required.' });
+      }
+
+      if (isUsingDemoStore()) {
+        const quote = demoStore.quotes.find((q) => q.id === id);
+        if (!quote) return reply.status(404).send({ error: 'QuoteNotFound' });
+        if (quote.subCompanyId !== request.actor.subCompanyId) {
+          return reply.status(403).send({ error: 'Forbidden' });
+        }
+        if (quote.status !== 'sent') {
+          return reply.status(409).send({
+            error: 'InvalidQuoteState',
+            message: `Cannot accept a quote with status "${quote.status}".`,
+          });
+        }
+
+        const prevStatus = quote.status;
+        quote.status = 'accepted';
+        quote.rounds.push({
+          roundNumber: quote.rounds.length + 1,
+          actorType: 'subcontractor',
+          proposedTotalCents: quote.quotedTotalCents,
+          comment: 'Accepted quote as issued.',
+          createdAt: new Date().toISOString(),
+        });
+
+        await writeAuditLog({
+          actorUserId: request.actor.userId,
+          actorEmail: request.actor.email,
+          action: 'QUOTE_ACCEPTED_BY_SUB',
+          entityType: 'quote',
+          entityId: quote.id,
+          homeId: quote.homeId,
+          ipAddress: request.ip,
+          beforeValues: { status: prevStatus },
+          afterValues: { status: quote.status, quotedTotalCents: quote.quotedTotalCents },
+        });
+
+        return { quote };
+      }
+
+      if (!isValidUuid(id)) return reply.status(404).send({ error: 'QuoteNotFound' });
+      const db = getDb();
+      const [quote] = await db.select().from(quotes).where(eq(quotes.id, id)).limit(1);
+      if (!quote) return reply.status(404).send({ error: 'QuoteNotFound' });
+      if (quote.subCompanyId !== request.actor.subCompanyId) {
+        return reply.status(403).send({ error: 'Forbidden' });
+      }
+      if (quote.status !== 'sent') {
+        return reply.status(409).send({
+          error: 'InvalidQuoteState',
+          message: `Cannot accept a quote with status "${quote.status}".`,
+        });
+      }
+
+      const existingRounds = await db
+        .select({ roundNumber: quoteRounds.roundNumber })
+        .from(quoteRounds)
+        .where(eq(quoteRounds.quoteId, quote.id));
+      const nextRoundNumber =
+        existingRounds.reduce((max, r) => Math.max(max, r.roundNumber), 0) + 1;
+
+      await db.transaction(async (tx) => {
+        await tx
+          .update(quotes)
+          .set({ status: 'accepted', decidedAt: new Date() })
+          .where(eq(quotes.id, quote.id));
+
+        await tx.insert(quoteRounds).values({
+          quoteId: quote.id,
+          roundNumber: nextRoundNumber,
+          actorType: 'subcontractor',
+          actorUserId: isValidUuid(request.actor.userId) ? request.actor.userId : null,
+          proposedTotalCents: quote.quotedTotalCents,
+          comment: 'Accepted quote as issued.',
+        });
+      });
+
+      await writeAuditLog({
+        actorUserId: request.actor.userId,
+        actorEmail: request.actor.email,
+        action: 'QUOTE_ACCEPTED_BY_SUB',
+        entityType: 'quote',
+        entityId: quote.id,
+        homeId: quote.homeId,
+        ipAddress: request.ip,
+        beforeValues: { status: quote.status },
+        afterValues: { status: 'accepted', quotedTotalCents: quote.quotedTotalCents },
+      });
+
+      const updatedQuote = await loadPostgresQuoteById(quote.id);
+      return { quote: updatedQuote };
+    }
+  );
+
+  app.post(
     '/api/quotes/:id/decision',
     {
       preHandler: [requirePermission('quotes:decide')],
@@ -403,6 +548,13 @@ export async function registerQuoteRoutes(app: FastifyInstance) {
       if (isUsingDemoStore()) {
         const quote = demoStore.quotes.find((q) => q.id === id);
         if (!quote) return reply.status(404).send({ error: 'QuoteNotFound' });
+
+        if (quote.status !== 'sent' && quote.status !== 'sub_adjusted') {
+          return reply.status(409).send({
+            error: 'InvalidQuoteState',
+            message: `Quote is already finalized ("${quote.status}") and cannot be modified.`,
+          });
+        }
 
         const prevStatus = quote.status;
         if (parsed.data.decision === 'accept') {
@@ -441,6 +593,13 @@ export async function registerQuoteRoutes(app: FastifyInstance) {
       const db = getDb();
       const [quote] = await db.select().from(quotes).where(eq(quotes.id, id)).limit(1);
       if (!quote) return reply.status(404).send({ error: 'QuoteNotFound' });
+
+      if (quote.status !== 'sent' && quote.status !== 'sub_adjusted') {
+        return reply.status(409).send({
+          error: 'InvalidQuoteState',
+          message: `Quote is already finalized ("${quote.status}") and cannot be modified.`,
+        });
+      }
 
       const rounds = await db
         .select()

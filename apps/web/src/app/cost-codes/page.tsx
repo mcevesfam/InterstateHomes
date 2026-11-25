@@ -2,6 +2,7 @@
 
 import React, { useState } from 'react';
 import { COST_CLASSIFICATIONS, COST_CODES } from '@interstate/shared';
+import { usePageContext } from '@/lib/page-context';
 
 export default function CostCodesPage() {
   const [search, setSearch] = useState('');
@@ -16,6 +17,17 @@ export default function CostCodesPage() {
       cc.name.toLowerCase().includes(q) ||
       cc.estimateBuiltFrom.toLowerCase().includes(q)
     );
+  });
+
+  usePageContext({
+    section: 'Cost Codes',
+    entityType: 'cost_code_list',
+    entityLabel: `${filtered.length} of ${COST_CODES.length} Cost Codes`,
+    summary: {
+      totalCodes: COST_CODES.length,
+      filteredCodes: filtered.length,
+      clsFilter,
+    },
   });
 
   return (
@@ -128,30 +140,38 @@ export default function CostCodesPage() {
             </tr>
           </thead>
           <tbody className="divide-y divide-[#E3E3DE]">
-            {filtered.map((cc) => (
-              <tr key={cc.code} className="hover:bg-[#F4F4F1]/40">
-                <td className="py-2.5 px-4 font-mono font-bold">{cc.code}</td>
-                <td className="py-2.5 px-3 text-[#5F5F5A]">
-                  {cc.classificationCode} {cc.classificationName}
-                </td>
-                <td className="py-2.5 px-3 font-semibold text-[#111111]">{cc.name}</td>
-                <td className="py-2.5 px-3 uppercase text-[10px] font-semibold">
-                  {cc.pricingSources.join(' / ')}
-                </td>
-                <td className="py-2.5 px-3">
-                  {cc.isInternalOnly ? (
-                    <span className="px-2 py-0.5 rounded bg-[#111111] text-[#FCAE1A] text-[10px] font-semibold whitespace-nowrap">
-                      Internal Only
-                    </span>
-                  ) : (
-                    <span className="text-[#5F5F5A]">Standard</span>
-                  )}
-                </td>
-                <td className="py-2.5 px-4 text-[#5F5F5A]">
-                  {cc.allowedSubLines.join(', ') || '—'}
+            {filtered.length === 0 ? (
+              <tr>
+                <td colSpan={6} className="py-6 px-4 text-center text-[#5F5F5A]">
+                  No cost codes match your search or classification filter.
                 </td>
               </tr>
-            ))}
+            ) : (
+              filtered.map((cc) => (
+                <tr key={cc.code} className="hover:bg-[#F4F4F1]/40">
+                  <td className="py-2.5 px-4 font-mono font-bold">{cc.code}</td>
+                  <td className="py-2.5 px-3 text-[#5F5F5A]">
+                    {cc.classificationCode} {cc.classificationName}
+                  </td>
+                  <td className="py-2.5 px-3 font-semibold text-[#111111]">{cc.name}</td>
+                  <td className="py-2.5 px-3 uppercase text-[10px] font-semibold">
+                    {cc.pricingSources.join(' / ')}
+                  </td>
+                  <td className="py-2.5 px-3">
+                    {cc.isInternalOnly ? (
+                      <span className="px-2 py-0.5 rounded bg-[#111111] text-[#FCAE1A] text-[10px] font-semibold whitespace-nowrap">
+                        Internal Only
+                      </span>
+                    ) : (
+                      <span className="text-[#5F5F5A]">Standard</span>
+                    )}
+                  </td>
+                  <td className="py-2.5 px-4 text-[#5F5F5A]">
+                    {cc.allowedSubLines.join(', ') || '—'}
+                  </td>
+                </tr>
+              ))
+            )}
           </tbody>
         </table>
       </div>

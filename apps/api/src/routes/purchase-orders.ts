@@ -3,6 +3,7 @@ import { and, desc, eq } from 'drizzle-orm';
 import {
   COST_CODE_MAP,
   DEFAULT_SYSTEM_SETTINGS,
+  INTERNAL_ONLY_COST_CODES,
   canAccess,
   checkSubComplianceForPO,
   createPurchaseOrderSchema,
@@ -30,12 +31,28 @@ import { isValidUuid, writeAuditLog } from '../security/audit.js';
 import { createPoDocuSealSubmission } from '../services/docuseal.js';
 
 export async function registerPurchaseOrderRoutes(app: FastifyInstance) {
-  app.get('/api/purchase-orders', { schema: { tags: ['Purchase Orders'] } }, async (request) => {
+  app.get('/api/purchase-orders', { schema: { tags: ['Purchase Orders'] } }, async (request, reply) => {
+    if (request.actor.role === 'homeowner') {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
+    const canSeeInternal = canAccess(request.actor.role, 'financials:view_internal');
+
     if (isUsingDemoStore()) {
-      const pos =
-        request.actor.role === 'subcontractor' && request.actor.subCompanyId
-          ? demoStore.purchaseOrders.filter((p) => p.subCompanyId === request.actor.subCompanyId)
-          : demoStore.purchaseOrders;
+      if (request.actor.role === 'subcontractor') {
+        if (!request.actor.subCompanyId) {
+          return { purchaseOrders: [] };
+        }
+        return {
+          purchaseOrders: demoStore.purchaseOrders.filter(
+            (p) =>
+              p.subCompanyId === request.actor.subCompanyId &&
+              !INTERNAL_ONLY_COST_CODES.has(p.costCode)
+          ),
+        };
+      }
+      const pos = demoStore.purchaseOrders.filter(
+        (p) => canSeeInternal || !INTERNAL_ONLY_COST_CODES.has(p.costCode)
+      );
       return { purchaseOrders: pos };
     }
 
@@ -65,8 +82,12 @@ export async function registerPurchaseOrderRoutes(app: FastifyInstance) {
     const subMap = new Map(subRows.map((s) => [s.id, s.legalName]));
     const codeMap = new Map(codeRows.map((c) => [c.code, c.name]));
 
+    const visibleRows = poRows.filter(
+      (p) => canSeeInternal || !INTERNAL_ONLY_COST_CODES.has(p.costCode)
+    );
+
     return {
-      purchaseOrders: poRows.map((p) => ({
+      purchaseOrders: visibleRows.map((p) => ({
         id: p.id,
         poNumber: p.poNumber,
         homeId: p.homeId,
@@ -104,12 +125,37 @@ export async function registerPurchaseOrderRoutes(app: FastifyInstance) {
       }
       const d = parsed.data;
 
+      // Reject non-estimateable "00" and internal-only cost codes on POs (SOW Section 7 & 9)
+      if (d.costCode === '00' || INTERNAL_ONLY_COST_CODES.has(d.costCode)) {
+        return reply.status(400).send({
+          error: 'InvalidCostCode',
+          message: `Cost code "${d.costCode}" cannot be used for a subcontractor or supplier Purchase Order.`,
+        });
+      }
+
       if (isUsingDemoStore()) {
         const home = demoStore.homes.find((h) => h.id === d.homeId);
         const sub = demoStore.subcontractors.find((s) => s.id === d.subId);
         const cc = COST_CODE_MAP.get(d.costCode);
         if (!home || !sub || !cc) {
           return reply.status(404).send({ error: 'ReferencedEntityNotFound' });
+        }
+
+        // Prevent compliance gate bypass via client-controlled poType
+        if (
+          d.poType === 'supplier' &&
+          (sub.companyType === 'subcontractor' || !cc.pricingSources.includes('supplier'))
+        ) {
+          return reply.status(422).send({
+            error: 'InvalidPoType',
+            message: `Cannot issue a supplier PO for subcontractor "${sub.legalName}" on cost code ${cc.code}.`,
+          });
+        }
+        if (d.poType === 'subcontractor' && sub.companyType === 'supplier') {
+          return reply.status(422).send({
+            error: 'InvalidPoType',
+            message: `Cannot issue a subcontractor PO to supplier-only vendor "${sub.legalName}".`,
+          });
         }
 
         // Section 8.2 & Rule 4: Block PO if any required compliance document is missing/expired
@@ -139,19 +185,28 @@ export async function registerPurchaseOrderRoutes(app: FastifyInstance) {
           });
           return reply.status(422).send({
             error: 'ComplianceBlocked',
+            subCompanyId: sub.id,
             message: `${sub.legalName} cannot receive a PO due to compliance issues.`,
             blockingReasons: compliance.blockingReasons,
           });
         }
 
-        const existingSameCodeCount = demoStore.purchaseOrders.filter(
+        const existingSameCode = demoStore.purchaseOrders.filter(
           (p) => p.homeId === home.id && p.costCode === d.costCode
-        ).length;
+        );
+        const existingSameType = existingSameCode.filter((p) => p.poType === d.poType);
+        if (existingSameType.length > 0 && !d.splitScopeOverrideReason?.trim()) {
+          return reply.status(422).send({
+            error: 'SplitScopeOverrideRequired',
+            message: `A ${d.poType} PO already exists for ${home.homeCode} cost code ${d.costCode}. Provide a split-scope override reason to issue an additional PO.`,
+          });
+        }
+
         const poNumber = formatPoNumber(
           home.subdivisionCode,
           home.lot,
           d.costCode,
-          existingSameCodeCount + 1
+          existingSameCode.length + 1
         );
 
         const docuseal = await createPoDocuSealSubmission({
@@ -200,7 +255,12 @@ export async function registerPurchaseOrderRoutes(app: FastifyInstance) {
           entityId: poNumber,
           homeId: home.id,
           ipAddress: request.ip,
-          afterValues: { poNumber, poType: d.poType, totalCents: d.totalCents },
+          afterValues: {
+            poNumber,
+            poType: d.poType,
+            totalCents: d.totalCents,
+            splitScopeOverrideReason: d.splitScopeOverrideReason ?? null,
+          },
         });
 
         return reply.status(201).send({ purchaseOrder: newPo, docuseal });
@@ -224,7 +284,7 @@ export async function registerPurchaseOrderRoutes(app: FastifyInstance) {
         db.select().from(subContacts).where(eq(subContacts.subCompanyId, d.subId)),
         db.select().from(systemSettings).where(eq(systemSettings.id, 'default')).limit(1),
         db
-          .select({ id: purchaseOrders.id })
+          .select({ id: purchaseOrders.id, poType: purchaseOrders.poType, status: purchaseOrders.status })
           .from(purchaseOrders)
           .where(
             and(eq(purchaseOrders.homeId, d.homeId), eq(purchaseOrders.costCode, d.costCode))
@@ -233,6 +293,23 @@ export async function registerPurchaseOrderRoutes(app: FastifyInstance) {
 
       if (!home || !sub || !cc) {
         return reply.status(404).send({ error: 'ReferencedEntityNotFound' });
+      }
+
+      // Prevent compliance gate bypass via client-controlled poType
+      if (
+        d.poType === 'supplier' &&
+        (sub.companyType === 'subcontractor' || !cc.pricingSourcesJson.includes('supplier'))
+      ) {
+        return reply.status(422).send({
+          error: 'InvalidPoType',
+          message: `Cannot issue a supplier PO for subcontractor "${sub.legalName}" on cost code ${cc.code}.`,
+        });
+      }
+      if (d.poType === 'subcontractor' && sub.companyType === 'supplier') {
+        return reply.status(422).send({
+          error: 'InvalidPoType',
+          message: `Cannot issue a subcontractor PO to supplier-only vendor "${sub.legalName}".`,
+        });
       }
 
       const minGlLimitCents =
@@ -246,6 +323,8 @@ export async function registerPurchaseOrderRoutes(app: FastifyInstance) {
         DEFAULT_SYSTEM_SETTINGS.currentMasterAgreementVersion;
 
       const mappedDocs: ComplianceDocRecord[] = docs.map((doc) => ({
+        id: doc.id,
+        fileName: doc.fileName,
         docType: doc.docType as ComplianceDocType,
         reviewStatus: doc.reviewStatus as 'pending' | 'approved' | 'rejected',
         expiresAt: doc.expiresAt ?? null,
@@ -285,54 +364,89 @@ export async function registerPurchaseOrderRoutes(app: FastifyInstance) {
         });
         return reply.status(422).send({
           error: 'ComplianceBlocked',
+          subCompanyId: sub.id,
           message: `${sub.legalName} cannot receive a PO due to compliance issues.`,
           blockingReasons: compliance.blockingReasons,
         });
       }
 
-      const poNumber = formatPoNumber(
-        home.subdivisionCode,
-        home.lot,
-        d.costCode,
-        existingPos.length + 1
+      const existingSameType = existingPos.filter(
+        (p) => p.poType === d.poType && p.status !== 'voided'
       );
+      if (existingSameType.length > 0 && !d.splitScopeOverrideReason?.trim()) {
+        return reply.status(422).send({
+          error: 'SplitScopeOverrideRequired',
+          message: `A ${d.poType} PO already exists for ${home.homeCode} cost code ${d.costCode}. Provide a split-scope override reason to issue an additional PO.`,
+        });
+      }
 
       const primaryContact = contacts.find((c) => c.isSigner) ?? contacts[0];
       const masterAgreementRef =
         d.poType === 'subcontractor' ? `MSA v${currentMasterAgreementVersion}` : null;
 
-      const docuseal = await createPoDocuSealSubmission({
-        poNumber,
-        documentTitle: `${poNumber} — ${cc.name}`,
-        subSignerName: primaryContact?.fullName ?? sub.legalName,
-        subSignerEmail: primaryContact?.email ?? 'office@interstatehomes.com',
-        approverName: request.actor.fullName,
-        approverEmail: request.actor.email,
-        masterAgreementRef: masterAgreementRef ?? 'Supplier Terms',
-        totalCents: d.totalCents,
-      });
+      let inserted: typeof purchaseOrders.$inferSelect | undefined;
+      let poNumber = '';
+      let docuseal: Awaited<ReturnType<typeof createPoDocuSealSubmission>> | undefined;
 
-      const [inserted] = await db
-        .insert(purchaseOrders)
-        .values({
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const currentPos = await db
+          .select({ id: purchaseOrders.id })
+          .from(purchaseOrders)
+          .where(
+            and(eq(purchaseOrders.homeId, d.homeId), eq(purchaseOrders.costCode, d.costCode))
+          );
+        poNumber = formatPoNumber(
+          home.subdivisionCode,
+          home.lot,
+          d.costCode,
+          currentPos.length + 1 + attempt
+        );
+
+        docuseal = await createPoDocuSealSubmission({
           poNumber,
-          homeId: home.id,
-          costCode: cc.code,
-          subCompanyId: sub.id,
-          poType: d.poType,
-          scopeSummary: d.scopeSummary,
-          planRevision: d.planRevision,
+          documentTitle: `${poNumber} — ${cc.name}`,
+          subSignerName: primaryContact?.fullName ?? sub.legalName,
+          subSignerEmail: primaryContact?.email ?? 'office@interstatehomes.com',
+          approverName: request.actor.fullName,
+          approverEmail: request.actor.email,
+          masterAgreementRef: masterAgreementRef ?? 'Supplier Terms',
           totalCents: d.totalCents,
-          masterAgreementRef,
-          splitScopeOverrideBy:
-            d.splitScopeOverrideReason && isValidUuid(request.actor.userId)
-              ? request.actor.userId
-              : null,
-          splitScopeOverrideReason: d.splitScopeOverrideReason ?? null,
-          status: 'pending_sub_signature',
-          docusealSubmissionId: docuseal.submissionId,
-        })
-        .returning();
+        });
+
+        try {
+          const [row] = await db
+            .insert(purchaseOrders)
+            .values({
+              poNumber,
+              homeId: home.id,
+              costCode: cc.code,
+              subCompanyId: sub.id,
+              poType: d.poType,
+              scopeSummary: d.scopeSummary,
+              planRevision: d.planRevision,
+              totalCents: d.totalCents,
+              masterAgreementRef,
+              splitScopeOverrideBy:
+                d.splitScopeOverrideReason && isValidUuid(request.actor.userId)
+                  ? request.actor.userId
+                  : null,
+              splitScopeOverrideReason: d.splitScopeOverrideReason ?? null,
+              status: 'pending_sub_signature',
+              docusealSubmissionId: docuseal.submissionId,
+            })
+            .returning();
+          inserted = row;
+          break;
+        } catch (err) {
+          const pgCode = (err as { code?: string })?.code;
+          if (pgCode === '23505' && attempt < 4) continue;
+          throw err;
+        }
+      }
+
+      if (!inserted || !docuseal) {
+        return reply.status(409).send({ error: 'PoNumberConflict', message: 'Could not allocate unique PO number.' });
+      }
 
       await writeAuditLog({
         actorUserId: request.actor.userId,
@@ -342,26 +456,31 @@ export async function registerPurchaseOrderRoutes(app: FastifyInstance) {
         entityId: poNumber,
         homeId: home.id,
         ipAddress: request.ip,
-        afterValues: { poNumber, poType: d.poType, totalCents: d.totalCents },
+        afterValues: {
+          poNumber,
+          poType: d.poType,
+          totalCents: d.totalCents,
+          splitScopeOverrideReason: d.splitScopeOverrideReason ?? null,
+        },
       });
 
       return reply.status(201).send({
         purchaseOrder: {
-          id: inserted!.id,
-          poNumber: inserted!.poNumber,
-          homeId: inserted!.homeId,
+          id: inserted.id,
+          poNumber: inserted.poNumber,
+          homeId: inserted.homeId,
           homeCode: home.homeCode,
-          costCode: inserted!.costCode,
+          costCode: inserted.costCode,
           costCodeName: cc.name,
-          subCompanyId: inserted!.subCompanyId,
+          subCompanyId: inserted.subCompanyId,
           subName: sub.legalName,
-          poType: inserted!.poType,
-          scopeSummary: inserted!.scopeSummary,
-          planRevision: inserted!.planRevision,
-          totalCents: inserted!.totalCents,
-          masterAgreementRef: inserted!.masterAgreementRef,
-          status: inserted!.status,
-          docusealSubmissionId: inserted!.docusealSubmissionId ?? '',
+          poType: inserted.poType,
+          scopeSummary: inserted.scopeSummary,
+          planRevision: inserted.planRevision,
+          totalCents: inserted.totalCents,
+          masterAgreementRef: inserted.masterAgreementRef,
+          status: inserted.status,
+          docusealSubmissionId: inserted.docusealSubmissionId ?? '',
           subSignedAt: null,
           approverSignedAt: null,
         },
@@ -383,15 +502,18 @@ export async function registerPurchaseOrderRoutes(app: FastifyInstance) {
         const po = demoStore.purchaseOrders.find((p) => p.id === id);
         if (!po) return reply.status(404).send({ error: 'PurchaseOrderNotFound' });
 
-        if (
-          request.actor.role === 'subcontractor' &&
-          po.subCompanyId !== request.actor.subCompanyId
-        ) {
-          return reply.status(403).send({ error: 'Forbidden' });
-        }
-
         const prevStatus = po.status;
         if (po.status === 'pending_sub_signature') {
+          if (
+            !canAccess(request.actor.role, 'pos:sign_sub') ||
+            !request.actor.subCompanyId ||
+            po.subCompanyId !== request.actor.subCompanyId
+          ) {
+            return reply.status(403).send({
+              error: 'Forbidden',
+              message: 'Only the assigned subcontractor can apply the subcontractor e-signature.',
+            });
+          }
           po.status = 'pending_approver_signature';
           po.subSignedAt = new Date().toISOString();
         } else if (po.status === 'pending_approver_signature') {
@@ -401,8 +523,23 @@ export async function registerPurchaseOrderRoutes(app: FastifyInstance) {
               message: 'Approver permission is required for final PO counter-signature.',
             });
           }
+          if (
+            request.actor.approvalLimitCents !== null &&
+            request.actor.approvalLimitCents !== undefined &&
+            po.totalCents > request.actor.approvalLimitCents
+          ) {
+            return reply.status(403).send({
+              error: 'ApprovalLimitExceeded',
+              message: `PO total exceeds your approval limit of $${(request.actor.approvalLimitCents / 100).toLocaleString()}.`,
+            });
+          }
           po.status = 'fully_signed';
           po.approverSignedAt = new Date().toISOString();
+        } else {
+          return reply.status(409).send({
+            error: 'InvalidPoState',
+            message: `Purchase order ${po.poNumber} is already "${po.status}" and cannot be signed again.`,
+          });
         }
 
         await writeAuditLog({
@@ -431,13 +568,6 @@ export async function registerPurchaseOrderRoutes(app: FastifyInstance) {
         .limit(1);
       if (!po) return reply.status(404).send({ error: 'PurchaseOrderNotFound' });
 
-      if (
-        request.actor.role === 'subcontractor' &&
-        po.subCompanyId !== request.actor.subCompanyId
-      ) {
-        return reply.status(403).send({ error: 'Forbidden' });
-      }
-
       const prevStatus = po.status;
       const now = new Date();
       let nextStatus = po.status;
@@ -445,6 +575,16 @@ export async function registerPurchaseOrderRoutes(app: FastifyInstance) {
       let nextApproverSignedAt = po.approverSignedAt;
 
       if (po.status === 'pending_sub_signature') {
+        if (
+          !canAccess(request.actor.role, 'pos:sign_sub') ||
+          !request.actor.subCompanyId ||
+          po.subCompanyId !== request.actor.subCompanyId
+        ) {
+          return reply.status(403).send({
+            error: 'Forbidden',
+            message: 'Only the assigned subcontractor can apply the subcontractor e-signature.',
+          });
+        }
         nextStatus = 'pending_approver_signature';
         nextSubSignedAt = now;
       } else if (po.status === 'pending_approver_signature') {
@@ -454,8 +594,23 @@ export async function registerPurchaseOrderRoutes(app: FastifyInstance) {
             message: 'Approver permission is required for final PO counter-signature.',
           });
         }
+        if (
+          request.actor.approvalLimitCents !== null &&
+          request.actor.approvalLimitCents !== undefined &&
+          po.totalCents > request.actor.approvalLimitCents
+        ) {
+          return reply.status(403).send({
+            error: 'ApprovalLimitExceeded',
+            message: `PO total exceeds your approval limit of $${(request.actor.approvalLimitCents / 100).toLocaleString()}.`,
+          });
+        }
         nextStatus = 'fully_signed';
         nextApproverSignedAt = now;
+      } else {
+        return reply.status(409).send({
+          error: 'InvalidPoState',
+          message: `Purchase order ${po.poNumber} is already "${po.status}" and cannot be signed again.`,
+        });
       }
 
       const [updated] = await db

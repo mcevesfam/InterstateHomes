@@ -52,8 +52,7 @@ export async function createPoDocuSealSubmission(
     });
 
     if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`DocuSeal API error (${res.status}): ${body}`);
+      throw new Error(`DocuSeal submission failed (HTTP ${res.status}).`);
     }
 
     const data = (await res.json()) as { id?: string | number; slug?: string };

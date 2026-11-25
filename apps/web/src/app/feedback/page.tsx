@@ -100,7 +100,8 @@ export default function FeedbackPage() {
       if (urlId && res.items.some((i) => i.id === urlId)) {
         setSelectedId(urlId);
       } else if (!keepSelection || !selectedId || !res.items.some((i) => i.id === selectedId)) {
-        setSelectedId(res.items[0]?.id ?? null);
+        const isDesktop = typeof window !== 'undefined' && window.innerWidth >= 1024;
+        setSelectedId(isDesktop ? (res.items[0]?.id ?? null) : null);
       }
     } catch (err) {
       setToast({
@@ -253,6 +254,7 @@ export default function FeedbackPage() {
   const handleRetryGithub = async () => {
     if (!adminDetail) return;
     setActionBusy(true);
+    setToast(null);
     try {
       const res = await apiFetch<{ item: FeedbackItemAdminDTO; githubError?: string | null }>(
         `/api/feedback/${adminDetail.id}/retry-github`,
@@ -265,6 +267,11 @@ export default function FeedbackPage() {
           res.item.githubDispatchStatus === 'created'
             ? `Created GitHub Issue #${res.item.githubIssueNumber}.`
             : res.githubError || `GitHub status: ${res.item.githubDispatchStatus}`,
+      });
+    } catch (err) {
+      setToast({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Failed to retry GitHub issue creation.',
       });
     } finally {
       setActionBusy(false);

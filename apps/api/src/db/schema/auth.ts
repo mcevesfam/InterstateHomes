@@ -18,7 +18,7 @@ export const users = pgTable('users', {
   isSubCompanyAdmin: boolean('is_sub_company_admin').notNull().default(false),
   passwordHash: text('password_hash'),
   mfaSecretEncrypted: text('mfa_secret_encrypted'),
-  mfaEnabled: boolean('mfa_enabled').notNull().default(true),
+  mfaEnabled: boolean('mfa_enabled').notNull().default(false),
   approvalLimitCents: bigint('approval_limit_cents', { mode: 'number' }),
   status: text('status').notNull().default('active'), // active | disabled | locked
   failedLoginAttempts: integer('failed_login_attempts').notNull().default(0),

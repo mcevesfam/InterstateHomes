@@ -13,10 +13,17 @@ export function isDatabaseConfigured(): boolean {
 }
 
 export function isDemoMode(): boolean {
-  if (!isDatabaseConfigured()) {
-    return process.env.DEMO_MODE !== 'false';
+  if (process.env.DEMO_MODE === 'true') {
+    return true;
   }
-  return process.env.DEMO_MODE === 'true';
+  if (isDatabaseConfigured()) {
+    return false;
+  }
+  // Never fail open to demo mode in production when DATABASE_URL is missing
+  if (process.env.DEMO_MODE === 'false' || process.env.NODE_ENV === 'production') {
+    return false;
+  }
+  return true;
 }
 
 export function getPool(): pg.Pool {
@@ -29,7 +36,7 @@ export function getPool(): pg.Pool {
       connectionString.includes('neon.tech') || connectionString.includes('sslmode=require');
     pool = new Pool({
       connectionString,
-      ssl: needsSsl ? { rejectUnauthorized: false } : undefined,
+      ssl: needsSsl ? { rejectUnauthorized: true } : undefined,
       max: 10,
     });
   }

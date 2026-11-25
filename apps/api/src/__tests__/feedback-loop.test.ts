@@ -250,7 +250,7 @@ describe('Closed-Loop Feedback, Log Correlation & Fix-Plan Approval', () => {
       new Response(
         JSON.stringify({
           number: 42,
-          html_url: 'https://github.com/MCDesignCO/InterstateHomes/issues/42',
+          html_url: 'https://github.com/mcevesfam/InterstateHomes/issues/42',
         }),
         { status: 201, headers: { 'Content-Type': 'application/json' } }
       )

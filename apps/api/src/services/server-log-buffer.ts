@@ -64,7 +64,12 @@ export function getCorrelatedServerLogs(
   const cutoff = Date.now() - windowMs;
 
   const matched = buffer.filter((entry) => {
-    if (entry.requestId && idSet.has(entry.requestId)) return true;
+    if (entry.requestId && idSet.has(entry.requestId)) {
+      if (!actorUserId || entry.actorUserId === actorUserId) {
+        return true;
+      }
+      return false;
+    }
     if (
       actorUserId &&
       entry.actorUserId === actorUserId &&

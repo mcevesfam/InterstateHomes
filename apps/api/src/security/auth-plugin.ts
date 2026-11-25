@@ -22,6 +22,7 @@ export interface RequestActor {
   fullName: string;
   role: UserRole;
   subCompanyId: string | null;
+  approvalLimitCents?: number | null;
   lastReauthAt: number;
   mfaEnabled?: boolean;
   authenticated?: boolean;
@@ -52,17 +53,31 @@ export function isUsingDemoStore(): boolean {
   return isDemoMode() || !isDatabaseConfigured();
 }
 
+export function isSecureRequest(request?: FastifyRequest): boolean {
+  if (process.env.NODE_ENV === 'production') return true;
+  if (!request) return false;
+  const fwdProto = request.headers['x-forwarded-proto'];
+  if (typeof fwdProto === 'string' && fwdProto.split(',')[0]?.trim().toLowerCase() === 'https') {
+    return true;
+  }
+  return request.protocol === 'https';
+}
+
 function isPublicPath(url: string): boolean {
   const pathname = url.split('?')[0] ?? '/';
-  return (
+  if (
     pathname === '/api/health' ||
     pathname === '/api/auth/login' ||
     pathname === '/api/auth/mfa/verify' ||
-    pathname === '/api/auth/logout' ||
-    pathname === '/openapi.json' ||
-    pathname === '/docs' ||
-    pathname.startsWith('/docs/')
-  );
+    pathname === '/api/auth/logout'
+  ) {
+    return true;
+  }
+  // Protect Swagger/OpenAPI in production Postgres mode
+  if (process.env.NODE_ENV === 'production' && !isDemoMode()) {
+    return false;
+  }
+  return pathname === '/openapi.json' || pathname === '/docs' || pathname.startsWith('/docs/');
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +109,8 @@ export interface MemorySession {
 
 const demoAuthStateMap = new Map<string, DemoAuthUserState>();
 const demoSessionMap = new Map<string, MemorySession>();
+const authRateLimitMap = new Map<string, number[]>();
+const pendingMfaSetupMap = new Map<string, { encryptedSecret: string; expiresAt: number }>();
 let cachedDefaultDemoPasswordHash: string | null = null;
 
 async function getDefaultDemoPasswordHash(): Promise<string> {
@@ -123,6 +140,10 @@ export async function getOrInitDemoAuthState(userId: string): Promise<DemoAuthUs
   return state;
 }
 
+export function setDemoAuthState(userId: string, state: DemoAuthUserState): void {
+  demoAuthStateMap.set(userId, state);
+}
+
 export function getDemoSessionByToken(rawToken: string): MemorySession | undefined {
   const tokenHash = hashToken(rawToken);
   return demoSessionMap.get(tokenHash);
@@ -136,9 +157,69 @@ export function deleteDemoSession(tokenHash: string): void {
   demoSessionMap.delete(tokenHash);
 }
 
+export function revokeUserDemoSessions(userId: string): void {
+  const now = Date.now();
+  for (const [hash, sess] of demoSessionMap.entries()) {
+    if (sess.userId === userId) {
+      sess.revokedAt = now;
+      demoSessionMap.delete(hash);
+    }
+  }
+}
+
+export function checkAuthAttemptLimit(
+  bucket: 'mfa' | 'reauth',
+  subjectId: string,
+  maxAttempts = 5,
+  windowMs = 15 * 60_000
+): { allowed: boolean; attempts: number } {
+  const key = `${bucket}:${subjectId}`;
+  const now = Date.now();
+  const recent = (authRateLimitMap.get(key) ?? []).filter((ts) => now - ts < windowMs);
+  authRateLimitMap.set(key, recent);
+  return { allowed: recent.length < maxAttempts, attempts: recent.length };
+}
+
+export function recordFailedAuthAttempt(
+  bucket: 'mfa' | 'reauth',
+  subjectId: string,
+  windowMs = 15 * 60_000
+): number {
+  const key = `${bucket}:${subjectId}`;
+  const now = Date.now();
+  const recent = (authRateLimitMap.get(key) ?? []).filter((ts) => now - ts < windowMs);
+  recent.push(now);
+  authRateLimitMap.set(key, recent);
+  return recent.length;
+}
+
+export function clearAuthAttempts(bucket: 'mfa' | 'reauth', subjectId: string): void {
+  authRateLimitMap.delete(`${bucket}:${subjectId}`);
+}
+
+export function stagePendingMfaSecret(userId: string, encryptedSecret: string, ttlMs = 15 * 60_000): void {
+  pendingMfaSetupMap.set(userId, { encryptedSecret, expiresAt: Date.now() + ttlMs });
+}
+
+export function getStagedPendingMfaSecret(userId: string): string | null {
+  const entry = pendingMfaSetupMap.get(userId);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    pendingMfaSetupMap.delete(userId);
+    return null;
+  }
+  return entry.encryptedSecret;
+}
+
+export function clearStagedPendingMfaSecret(userId: string): void {
+  pendingMfaSetupMap.delete(userId);
+}
+
 export function resetDemoAuthState(): void {
   demoAuthStateMap.clear();
   demoSessionMap.clear();
+  authRateLimitMap.clear();
+  pendingMfaSetupMap.clear();
   cachedDefaultDemoPasswordHash = null;
 }
 
@@ -146,21 +227,25 @@ export function resetDemoAuthState(): void {
 // Cookie & Session creation helpers
 // ---------------------------------------------------------------------------
 
-export function setSessionCookie(reply: FastifyReply, rawToken: string): void {
+export function setSessionCookie(
+  reply: FastifyReply,
+  rawToken: string,
+  request?: FastifyRequest
+): void {
   reply.setCookie(SESSION_COOKIE_NAME, rawToken, {
     httpOnly: true,
     sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production',
+    secure: isSecureRequest(request),
     path: '/',
     maxAge: Math.floor(SESSION_ABSOLUTE_TTL_MS / 1000),
   });
 }
 
-export function clearSessionCookie(reply: FastifyReply): void {
+export function clearSessionCookie(reply: FastifyReply, request?: FastifyRequest): void {
   reply.clearCookie(SESSION_COOKIE_NAME, {
     httpOnly: true,
     sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production',
+    secure: isSecureRequest(request),
     path: '/',
   });
 }
@@ -226,6 +311,19 @@ export async function getSessionTimeoutMinutes(): Promise<number> {
   return row?.sessionTimeoutMinutes ?? DEFAULT_SYSTEM_SETTINGS.sessionTimeoutMinutes;
 }
 
+export async function getMinPasswordLength(): Promise<number> {
+  if (isUsingDemoStore()) {
+    return demoStore.settings.minPasswordLength;
+  }
+  const db = getDb();
+  const [row] = await db
+    .select({ minPasswordLength: systemSettings.minPasswordLength })
+    .from(systemSettings)
+    .where(eq(systemSettings.id, 'default'))
+    .limit(1);
+  return row?.minPasswordLength ?? DEFAULT_SYSTEM_SETTINGS.minPasswordLength;
+}
+
 // ---------------------------------------------------------------------------
 // Sync actor resolver (called from app.ts) + Async session auth hook
 // ---------------------------------------------------------------------------
@@ -236,9 +334,12 @@ export function resolveRequestActor(request: FastifyRequest): RequestActor {
   if (isDemoMode() && !request.cookies?.[SESSION_COOKIE_NAME]) {
     const headerRole = String(request.headers['x-demo-role'] ?? 'estimator_approver') as UserRole;
     const role: UserRole = VALID_ROLES.has(headerRole) ? headerRole : 'estimator_approver';
+    const rawSubHeader = request.headers['x-demo-sub-id'];
     const subCompanyId =
       role === 'subcontractor'
-        ? String(request.headers['x-demo-sub-id'] ?? demoStore.subcontractors[0]?.id ?? 'sub-red-cliffs')
+        ? rawSubHeader === ''
+          ? null
+          : String(rawSubHeader ?? demoStore.subcontractors[0]?.id ?? 'sub-red-cliffs')
         : null;
 
     const matchedUser = demoStore.users.find((u) => u.role === role) ?? demoStore.users[0]!;
@@ -248,6 +349,7 @@ export function resolveRequestActor(request: FastifyRequest): RequestActor {
       fullName: matchedUser.fullName,
       role,
       subCompanyId,
+      approvalLimitCents: matchedUser.approvalLimitCents,
       lastReauthAt: Date.now(),
       mfaEnabled: false,
       authenticated: true,
@@ -261,6 +363,7 @@ export function resolveRequestActor(request: FastifyRequest): RequestActor {
     fullName: 'Anonymous',
     role: 'homeowner',
     subCompanyId: null,
+    approvalLimitCents: null,
     lastReauthAt: 0,
     mfaEnabled: false,
     authenticated: false,
@@ -324,8 +427,10 @@ export async function authenticateRequest(
         fullName: users.fullName,
         role: users.role,
         subCompanyId: users.subCompanyId,
+        approvalLimitCents: users.approvalLimitCents,
         status: users.status,
         mfaEnabled: users.mfaEnabled,
+        mfaSecretEncrypted: users.mfaSecretEncrypted,
       })
       .from(sessions)
       .innerJoin(users, eq(sessions.userId, users.id))
@@ -334,7 +439,7 @@ export async function authenticateRequest(
 
     const record = rows[0];
     if (!record || record.status !== 'active' || record.expiresAt.getTime() <= Date.now()) {
-      clearSessionCookie(reply);
+      clearSessionCookie(reply, request);
       if (publicRoute) return;
       return reply.status(401).send({
         error: 'SessionExpired',
@@ -351,7 +456,7 @@ export async function authenticateRequest(
         .update(sessions)
         .set({ revokedAt: new Date() })
         .where(eq(sessions.id, record.sessionId));
-      clearSessionCookie(reply);
+      clearSessionCookie(reply, request);
       if (publicRoute) return;
       return reply.status(401).send({
         error: 'SessionTimeout',
@@ -376,8 +481,9 @@ export async function authenticateRequest(
       fullName: record.fullName,
       role,
       subCompanyId: record.subCompanyId ?? null,
+      approvalLimitCents: record.approvalLimitCents ?? null,
       lastReauthAt: record.lastReauthAt.getTime(),
-      mfaEnabled: record.mfaEnabled,
+      mfaEnabled: Boolean(record.mfaEnabled && record.mfaSecretEncrypted),
       authenticated: !isPendingMfa,
     };
 
@@ -402,7 +508,7 @@ export async function authenticateRequest(
   // Demo mode WITH ih_session cookie: enforce full session, timeout, and MFA state in memory
   const memSession = getDemoSessionByToken(rawToken!);
   if (!memSession || memSession.revokedAt !== null || memSession.expiresAt <= Date.now()) {
-    clearSessionCookie(reply);
+    clearSessionCookie(reply, request);
     if (publicRoute) return;
     return reply.status(401).send({
       error: 'SessionExpired',
@@ -415,7 +521,7 @@ export async function authenticateRequest(
   const timeoutMinutes = demoStore.settings.sessionTimeoutMinutes;
   if (Date.now() - memSession.lastActivityAt > timeoutMinutes * 60_000) {
     memSession.revokedAt = Date.now();
-    clearSessionCookie(reply);
+    clearSessionCookie(reply, request);
     if (publicRoute) return;
     return reply.status(401).send({
       error: 'SessionTimeout',
@@ -430,7 +536,7 @@ export async function authenticateRequest(
   const authState = demoUser ? await getOrInitDemoAuthState(demoUser.id) : null;
   if (!demoUser || !authState || authState.status !== 'active') {
     memSession.revokedAt = Date.now();
-    clearSessionCookie(reply);
+    clearSessionCookie(reply, request);
     if (publicRoute) return;
     return reply.status(401).send({
       error: 'Unauthorized',
@@ -449,8 +555,9 @@ export async function authenticateRequest(
     fullName: demoUser.fullName,
     role: demoUser.role,
     subCompanyId: demoUser.subCompanyId,
+    approvalLimitCents: demoUser.approvalLimitCents,
     lastReauthAt: memSession.lastReauthAt,
-    mfaEnabled: authState.mfaEnabled,
+    mfaEnabled: Boolean(authState.mfaEnabled && authState.mfaSecretEncrypted),
     authenticated: !memSession.mfaPending,
   };
 

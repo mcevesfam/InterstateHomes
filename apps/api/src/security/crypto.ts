@@ -3,8 +3,18 @@ import crypto from 'node:crypto';
 const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
 function getEncryptionKey(): Buffer {
+  const configured = process.env.APP_ENCRYPTION_KEY?.trim();
+  if (!configured) {
+    const allowFallback =
+      process.env.DEMO_MODE === 'true' ||
+      process.env.NODE_ENV === 'test' ||
+      (!process.env.DATABASE_URL?.trim() && process.env.NODE_ENV !== 'production');
+    if (!allowFallback) {
+      throw new Error('APP_ENCRYPTION_KEY must be configured when running in Postgres/production mode.');
+    }
+  }
   const raw =
-    process.env.APP_ENCRYPTION_KEY ??
+    configured ||
     '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
   if (/^[0-9a-fA-F]{64}$/.test(raw)) {
     return Buffer.from(raw, 'hex');

@@ -24,7 +24,7 @@ interface LoginResponse {
 
 export default function LoginPage() {
   const router = useRouter();
-  const { authMode, authenticated, loading, refreshSession } = useRole();
+  const { role, authMode, authenticated, loading, authError, refreshSession } = useRole();
 
   const [step, setStep] = useState<LoginStep>('credentials');
   const [email, setEmail] = useState('');
@@ -39,9 +39,9 @@ export default function LoginPage() {
 
   useEffect(() => {
     if (!loading && authMode === 'postgres' && authenticated) {
-      router.replace('/');
+      router.replace(role === 'subcontractor' ? '/portal' : '/');
     }
-  }, [loading, authMode, authenticated, router]);
+  }, [loading, authMode, authenticated, role, router]);
 
   useEffect(() => {
     if (step === 'mfa') {
@@ -89,8 +89,9 @@ export default function LoginPage() {
         return;
       }
 
-      await refreshSession();
-      router.replace('/');
+      const refreshedUser = await refreshSession();
+      const resolvedRole = refreshedUser?.role ?? data.user?.role;
+      router.replace(resolvedRole === 'subcontractor' ? '/portal' : '/');
     } catch {
       setError('Unable to reach the authentication service. Please try again.');
     } finally {
@@ -124,8 +125,9 @@ export default function LoginPage() {
         return;
       }
 
-      await refreshSession();
-      router.replace('/');
+      const refreshedUser = await refreshSession();
+      const resolvedRole = refreshedUser?.role ?? data.user?.role;
+      router.replace(resolvedRole === 'subcontractor' ? '/portal' : '/');
     } catch {
       setError('Unable to verify MFA code right now. Please try again.');
     } finally {
@@ -178,14 +180,14 @@ export default function LoginPage() {
       {/* Sign-In Form Canvas */}
       <main className="flex items-start lg:items-center justify-center px-4 py-6 sm:p-10 safe-bottom">
         <div className="w-full max-w-md space-y-5">
-          {authMode === 'demo' && !loading ? (
+          {authMode === 'demo' && !loading && !authError ? (
             <div className="rounded-lg border border-[#FCAE1A]/40 bg-[#FFF9EB] px-4 py-2 text-xs text-[#5F4200] flex items-center justify-between gap-3">
               <span>Running in local Demo Mode.</span>
               <Link
-                href="/"
+                href={role === 'subcontractor' ? '/portal' : '/'}
                 className="min-h-[44px] inline-flex items-center font-display font-semibold text-[#111111] underline underline-offset-2 hover:text-[#8A5A00] shrink-0"
               >
-                Open Dashboard
+                {role === 'subcontractor' ? 'Open Portal' : 'Open Dashboard'}
               </Link>
             </div>
           ) : null}

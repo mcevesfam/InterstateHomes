@@ -58,6 +58,8 @@ export type ComplianceDocType =
   | 'master_agreement';
 
 export interface ComplianceDocRecord {
+  id?: string;
+  fileName?: string;
   docType: ComplianceDocType;
   reviewStatus: 'pending' | 'approved' | 'rejected';
   expiresAt?: string | null; // ISO date YYYY-MM-DD

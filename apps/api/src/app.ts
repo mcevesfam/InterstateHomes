@@ -102,6 +102,30 @@ export async function buildApp() {
     }
   });
 
+  app.setErrorHandler((error, request, reply) => {
+    const statusCode =
+      typeof (error as { statusCode?: unknown }).statusCode === 'number' &&
+      (error as { statusCode: number }).statusCode >= 400 &&
+      (error as { statusCode: number }).statusCode < 500
+        ? (error as { statusCode: number }).statusCode
+        : 500;
+
+    if (statusCode >= 500) {
+      return reply.status(500).send({
+        error: 'InternalServerError',
+        message: 'An unexpected error occurred while processing the request.',
+        requestId: request.correlationId,
+      });
+    }
+
+    const errObj = error instanceof Error ? error : null;
+    return reply.status(statusCode).send({
+      error: errObj?.name || 'BadRequest',
+      message: errObj?.message || 'Invalid request.',
+      requestId: request.correlationId,
+    });
+  });
+
   await registerHealthRoutes(app);
   await registerAuthRoutes(app);
   await registerDashboardRoutes(app);

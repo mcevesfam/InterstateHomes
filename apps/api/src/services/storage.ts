@@ -143,3 +143,45 @@ export async function uploadBufferToStorage(
 
   return { provider: 'mock', storageKey };
 }
+
+export async function downloadBufferFromStorage(
+  storageKey: string
+): Promise<{ buffer: Buffer; contentType: string } | null> {
+  const gcs = getGcsStorage();
+  if (gcs) {
+    try {
+      const file = gcs.bucket(process.env.GCS_BUCKET!).file(storageKey);
+      const [buffer] = await file.download();
+      const [meta] = await file.getMetadata();
+      return {
+        buffer,
+        contentType:
+          typeof meta.contentType === 'string' ? meta.contentType : 'image/png',
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  const client = getS3Client();
+  if (client) {
+    try {
+      const res = await client.send(
+        new GetObjectCommand({
+          Bucket: process.env.S3_BUCKET!,
+          Key: storageKey,
+        })
+      );
+      if (!res.Body) return null;
+      const bytes = await res.Body.transformToByteArray();
+      return {
+        buffer: Buffer.from(bytes),
+        contentType: res.ContentType ?? 'image/png',
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
+}

@@ -2,7 +2,8 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
-import { ChevronDown, ChevronRight, Printer } from 'lucide-react';
+import { ChevronDown, ChevronRight, Pencil, Printer, X } from 'lucide-react';
+import { canAccess, type PricingSource } from '@interstate/shared';
 import { apiFetch, formatCurrencyExact } from '@/lib/api';
 import { usePageContext } from '@/lib/page-context';
 import { useRole } from '@/lib/role-context';
@@ -23,11 +24,13 @@ interface EstimateLine {
   quantity: number;
   unit: string;
   quantitySource: string;
-  pricingSource: string;
+  pricingSource: PricingSource;
   selectedSubId: string | null;
   selectedSubName: string | null;
   unitPriceCents: number;
   extendedCents: number;
+  isAllowanceOrFixed?: boolean;
+  notes?: string;
   competingSubQuotes: Array<{
     subId: string;
     subName: string;
@@ -60,6 +63,17 @@ interface HomeownerProjection {
   }>;
 }
 
+interface EditLineDraft {
+  costCode: string;
+  costCodeName: string;
+  quantity: string;
+  unit: string;
+  pricingSource: PricingSource;
+  unitPriceDollars: string;
+  fixedAmountDollars: string;
+  notes: string;
+}
+
 function isLineActive(line: EstimateLine): boolean {
   return (
     line.extendedCents > 0 ||
@@ -71,18 +85,32 @@ function isLineActive(line: EstimateLine): boolean {
 
 export default function EstimatesPage() {
   const { role, subCompanyId } = useRole();
+  const isSubcontractor = role === 'subcontractor';
+  const canBuild = canAccess(role, 'estimates:build');
+  const canExportHomeowner = canAccess(role, 'estimates:export_homeowner');
+  const canIntake = canAccess(role, 'plans:intake');
+
   const [homes, setHomes] = useState<HomeSummary[]>([]);
-  const [loadingHomes, setLoadingHomes] = useState(true);
+  const [loadingHomes, setLoadingHomes] = useState(!isSubcontractor);
   const [homesError, setHomesError] = useState<string | null>(null);
   const [homeId, setHomeId] = useState('');
   const [data, setData] = useState<EstimatePayload | null>(null);
   const [loadingEstimate, setLoadingEstimate] = useState(false);
   const [estimateError, setEstimateError] = useState<string | null>(null);
+  const [actionBanner, setActionBanner] = useState<{ type: 'ok' | 'err'; text: string } | null>(
+    null
+  );
+  const [busyCostCode, setBusyCostCode] = useState<string | null>(null);
   const [homeownerPreview, setHomeownerPreview] = useState<HomeownerProjection | null>(null);
   const [showHomeownerPdf, setShowHomeownerPdf] = useState(false);
   const [activeOnly, setActiveOnly] = useState(false);
   const [selectedClassification, setSelectedClassification] = useState<string>('all');
   const [collapsedCodes, setCollapsedCodes] = useState<Record<string, boolean>>({});
+
+  // Line editor modal state
+  const [editDraft, setEditDraft] = useState<EditLineDraft | null>(null);
+  const [savingLine, setSavingLine] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -91,14 +119,23 @@ export default function EstimatesPage() {
     }
   }, []);
 
-  useEffect(() => {
-    let active = true;
-    setLoadingHomes(true);
-    setHomesError(null);
-
-    apiFetch<{ homes: HomeSummary[] }>('/api/homes', { role, subCompanyId })
-      .then((res) => {
-        if (!active) return;
+  const fetchHomes = useCallback(
+    async (isCancelled?: () => boolean) => {
+      if (isSubcontractor) {
+        setHomes([]);
+        setHomeId('');
+        setLoadingHomes(false);
+        setHomesError(null);
+        return;
+      }
+      setLoadingHomes(true);
+      setHomesError(null);
+      try {
+        const res = await apiFetch<{ homes: HomeSummary[] }>('/api/homes', {
+          role,
+          subCompanyId,
+        });
+        if (isCancelled?.()) return;
         const list = res.homes ?? [];
         setHomes(list);
 
@@ -112,31 +149,37 @@ export default function EstimatesPage() {
           if (paramHomeId && list.some((h) => h.id === paramHomeId)) return paramHomeId;
           return list[0]?.id ?? '';
         });
-      })
-      .catch((err: unknown) => {
-        if (!active) return;
+      } catch (err: unknown) {
+        if (isCancelled?.()) return;
         setHomes([]);
         setHomeId('');
         setHomesError(err instanceof Error ? err.message : 'Failed to load homes');
-      })
-      .finally(() => {
-        if (active) setLoadingHomes(false);
-      });
+      } finally {
+        if (!isCancelled?.()) setLoadingHomes(false);
+      }
+    },
+    [isSubcontractor, role, subCompanyId]
+  );
 
+  useEffect(() => {
+    let cancelled = false;
+    void fetchHomes(() => cancelled);
     return () => {
-      active = false;
+      cancelled = true;
     };
-  }, [role, subCompanyId]);
+  }, [fetchHomes]);
 
   usePageContext({
     section: 'Estimates',
     entityType: homeId ? 'home' : 'workspace',
     entityId: homeId || undefined,
-    entityLabel: data
-      ? `${data.home.homeCode} (v${data.estimate.versionNumber})`
-      : homes.length === 0
-        ? 'No Homes'
-        : homeId,
+    entityLabel: isSubcontractor
+      ? 'Restricted'
+      : data
+        ? `${data.home.homeCode} (v${data.estimate.versionNumber})`
+        : homes.length === 0
+          ? 'No Homes'
+          : homeId,
     summary: {
       homeCode: data?.home.homeCode ?? null,
       estimateStatus: data?.estimate.status ?? null,
@@ -148,7 +191,7 @@ export default function EstimatesPage() {
 
   const loadEstimate = useCallback(
     async (targetHomeId: string, isCancelled?: () => boolean) => {
-      if (!targetHomeId) {
+      if (isSubcontractor || !targetHomeId) {
         setData(null);
         setEstimateError(null);
         setLoadingEstimate(false);
@@ -171,11 +214,11 @@ export default function EstimatesPage() {
         if (!isCancelled?.()) setLoadingEstimate(false);
       }
     },
-    [role, subCompanyId]
+    [isSubcontractor, role, subCompanyId]
   );
 
   useEffect(() => {
-    if (!homeId) {
+    if (isSubcontractor || !homeId) {
       setData(null);
       setHomeownerPreview(null);
       setShowHomeownerPdf(false);
@@ -193,10 +236,11 @@ export default function EstimatesPage() {
     return () => {
       cancelled = true;
     };
-  }, [homeId, loadEstimate]);
+  }, [homeId, isSubcontractor, loadEstimate]);
 
   const handleToggleHomeownerPdf = async () => {
-    if (!homeId) return;
+    if (!homeId || !canExportHomeowner) return;
+    setActionBanner(null);
     if (!showHomeownerPdf) {
       try {
         const res = await apiFetch<{ projection: HomeownerProjection }>(
@@ -206,27 +250,132 @@ export default function EstimatesPage() {
         setHomeownerPreview(res.projection);
         setShowHomeownerPdf(true);
       } catch (err: unknown) {
-        setEstimateError(
-          err instanceof Error ? err.message : 'Failed to load homeowner estimate preview'
-        );
+        setActionBanner({
+          type: 'err',
+          text:
+            err instanceof Error ? err.message : 'Failed to load homeowner estimate preview.',
+        });
       }
       return;
     }
     setShowHomeownerPdf(false);
   };
 
-  const handleSelectCompetingSub = async (costCode: string, subId: string, totalCents: number) => {
-    if (!homeId) return;
-    await apiFetch(`/api/estimates/${homeId}/lines/${costCode}`, {
-      method: 'PATCH',
-      role,
-      subCompanyId,
-      body: JSON.stringify({
-        selectedSubId: subId,
-        fixedAmountCents: totalCents,
-      }),
+  const handleSelectCompetingSub = async (
+    costCode: string,
+    subId: string,
+    subName: string,
+    totalCents: number
+  ) => {
+    if (!homeId || !canBuild) return;
+    setBusyCostCode(costCode);
+    setActionBanner(null);
+    try {
+      await apiFetch(`/api/estimates/${homeId}/lines/${costCode}`, {
+        method: 'PATCH',
+        role,
+        subCompanyId,
+        body: JSON.stringify({
+          selectedSubId: subId,
+          fixedAmountCents: totalCents,
+        }),
+      });
+      setActionBanner({
+        type: 'ok',
+        text: `Updated code ${costCode} to ${subName} (${formatCurrencyExact(totalCents)}).`,
+      });
+      await loadEstimate(homeId);
+    } catch (err: unknown) {
+      setActionBanner({
+        type: 'err',
+        text: err instanceof Error ? err.message : `Failed to update cost code ${costCode}.`,
+      });
+    } finally {
+      setBusyCostCode(null);
+    }
+  };
+
+  const openEditLine = (line: EstimateLine) => {
+    if (!canBuild) return;
+    const isFixedMode =
+      line.isAllowanceOrFixed ||
+      line.pricingSource === 'fixed' ||
+      line.pricingSource === 'allowance';
+    setEditError(null);
+    setEditDraft({
+      costCode: line.costCode,
+      costCodeName: line.costCodeName,
+      quantity: String(line.quantity),
+      unit: line.unit || 'LS',
+      pricingSource: line.pricingSource,
+      unitPriceDollars: (line.unitPriceCents / 100).toFixed(2),
+      fixedAmountDollars: isFixedMode ? (line.extendedCents / 100).toFixed(2) : '',
+      notes: line.notes ?? '',
     });
-    await loadEstimate(homeId);
+  };
+
+  const handleSaveEditLine = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editDraft || !homeId || !canBuild) return;
+
+    const quantityNum = Number(editDraft.quantity);
+    const unitPriceNum = Number(editDraft.unitPriceDollars);
+    const hasFixed = editDraft.fixedAmountDollars.trim() !== '';
+    const fixedNum = hasFixed ? Number(editDraft.fixedAmountDollars) : NaN;
+
+    if (!Number.isFinite(quantityNum) || quantityNum < 0) {
+      setEditError('Quantity must be a non-negative number.');
+      return;
+    }
+    if (!hasFixed && (!Number.isFinite(unitPriceNum) || unitPriceNum < 0)) {
+      setEditError('Unit price must be a non-negative dollar amount.');
+      return;
+    }
+    if (hasFixed && (!Number.isFinite(fixedNum) || fixedNum < 0)) {
+      setEditError('Fixed / allowance amount must be a non-negative dollar amount.');
+      return;
+    }
+
+    setSavingLine(true);
+    setEditError(null);
+    setActionBanner(null);
+
+    try {
+      const payload: Record<string, unknown> = {
+        unit: editDraft.unit.trim() || 'LS',
+        pricingSource: editDraft.pricingSource,
+        notes: editDraft.notes,
+        isAllowanceOrFixed:
+          editDraft.pricingSource === 'fixed' ||
+          editDraft.pricingSource === 'allowance' ||
+          hasFixed,
+      };
+
+      if (hasFixed) {
+        payload.fixedAmountCents = Math.round(fixedNum * 100);
+      } else {
+        payload.quantity = quantityNum;
+        payload.unitPriceCents = Math.round(unitPriceNum * 100);
+      }
+
+      await apiFetch(`/api/estimates/${homeId}/lines/${editDraft.costCode}`, {
+        method: 'PATCH',
+        role,
+        subCompanyId,
+        body: JSON.stringify(payload),
+      });
+
+      setActionBanner({
+        type: 'ok',
+        text: `Saved estimate line ${editDraft.costCode} ${editDraft.costCodeName}.`,
+      });
+      setEditDraft(null);
+      await loadEstimate(homeId);
+    } catch (err: unknown) {
+      setEditError(err instanceof Error ? err.message : 'Failed to save estimate line.');
+    } finally {
+      setSavingLine(false);
+    }
   };
 
   const classificationGroups = useMemo(() => {
@@ -295,6 +444,47 @@ export default function EstimatesPage() {
     setCollapsedCodes(next);
   };
 
+  if (isSubcontractor) {
+    return (
+      <div className="space-y-5">
+        <div>
+          <h1 className="text-2xl font-display font-bold text-[#111111]">
+            81-Code Estimate Builder
+          </h1>
+          <p className="text-xs text-[#5F5F5A] mt-0.5">
+            Internal Interstate Homes estimating workspace.
+          </p>
+        </div>
+        <div className="bg-white border border-[#E3E3DE] rounded-lg px-5 py-8 text-center space-y-4">
+          <div className="space-y-1.5 max-w-md mx-auto">
+            <h2 className="text-base font-display font-bold text-[#111111]">
+              Access Restricted to Internal Team
+            </h2>
+            <p className="text-xs text-[#5F5F5A]">
+              Full home estimates and internal margin schedules are not available in the
+              Subcontractor Portal. Review and respond to your assigned scopes in My Quotes or
+              Purchase Orders.
+            </p>
+          </div>
+          <div className="flex flex-col sm:flex-row items-center justify-center gap-2.5">
+            <Link
+              href="/quotes"
+              className="w-full sm:w-auto min-h-[44px] inline-flex items-center justify-center px-5 py-2.5 rounded-md bg-[#FCAE1A] text-xs font-display font-bold text-[#111111] hover:bg-[#111111] hover:text-white transition-colors"
+            >
+              Go to My Quotes
+            </Link>
+            <Link
+              href="/purchase-orders"
+              className="w-full sm:w-auto min-h-[44px] inline-flex items-center justify-center px-5 py-2.5 rounded-md border border-[#E3E3DE] bg-white text-xs font-display font-semibold text-[#111111] hover:border-[#111111] transition-colors"
+            >
+              View Purchase Orders
+            </Link>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-5">
       <div
@@ -328,7 +518,7 @@ export default function EstimatesPage() {
                 </option>
               ))}
             </select>
-            {(role === 'admin' || role === 'estimator_approver') && homeId ? (
+            {canExportHomeowner && homeId ? (
               <button
                 type="button"
                 onClick={handleToggleHomeownerPdf}
@@ -342,9 +532,40 @@ export default function EstimatesPage() {
         ) : null}
       </div>
 
+      {!canBuild ? (
+        <div
+          data-print-hide="true"
+          className="bg-[#F4F4F1] border border-[#E3E3DE] text-[#3B3B38] px-4 py-2.5 rounded-lg text-xs"
+        >
+          Read-only field view — internal margin codes (00L, 88, 92, 93) are hidden and estimate
+          editing is limited to Estimators and Admins.
+        </div>
+      ) : null}
+
+      {actionBanner ? (
+        <div
+          role="status"
+          data-print-hide="true"
+          className={`rounded-lg px-4 py-3 text-xs border break-words ${
+            actionBanner.type === 'err'
+              ? 'bg-[#FEF2F2] border-[#FECACA] text-[#991B1B]'
+              : 'bg-[#DCFCE7] border-[#BBF7D0] text-[#166534]'
+          }`}
+        >
+          {actionBanner.text}
+        </div>
+      ) : null}
+
       {homesError ? (
-        <div className="bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] px-4 py-3 rounded-lg text-xs">
-          Unable to load homes: {homesError}
+        <div className="bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] px-4 py-3 rounded-lg text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="min-w-0 break-words">Unable to load homes: {homesError}</div>
+          <button
+            type="button"
+            onClick={() => void fetchHomes()}
+            className="w-full sm:w-auto shrink-0 min-h-[44px] px-4 py-2 rounded-md border border-[#991B1B] bg-white text-xs font-display font-semibold text-[#991B1B] hover:bg-[#991B1B] hover:text-white transition-colors"
+          >
+            Retry
+          </button>
         </div>
       ) : null}
 
@@ -364,18 +585,21 @@ export default function EstimatesPage() {
               No homes ready for estimating yet
             </h2>
             <p className="text-xs text-[#5F5F5A]">
-              Create a home in Plan Intake to initialize all 81 estimate cost codes and begin
-              building quotes and subcontractor comparisons.
+              {canIntake
+                ? 'Create a home in Plan Intake to initialize all 81 estimate cost codes and begin building quotes and subcontractor comparisons.'
+                : 'Homes will appear here once an Estimator or Admin completes Plan Intake.'}
             </p>
           </div>
-          <div className="flex justify-center">
-            <Link
-              href="/homes?intake=1"
-              className="w-full sm:w-auto min-h-[44px] inline-flex items-center justify-center px-5 py-2.5 rounded-md bg-[#FCAE1A] text-xs font-display font-bold text-[#111111] hover:bg-[#111111] hover:text-white active:bg-[#111111] active:text-white transition-colors"
-            >
-              + New Plan Intake
-            </Link>
-          </div>
+          {canIntake ? (
+            <div className="flex justify-center">
+              <Link
+                href="/homes?intake=1"
+                className="w-full sm:w-auto min-h-[44px] inline-flex items-center justify-center px-5 py-2.5 rounded-md bg-[#FCAE1A] text-xs font-display font-bold text-[#111111] hover:bg-[#111111] hover:text-white active:bg-[#111111] active:text-white transition-colors"
+              >
+                + New Plan Intake
+              </Link>
+            </div>
+          ) : null}
         </div>
       ) : estimateError ? (
         <div className="bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] px-4 py-4 rounded-lg text-xs space-y-3">
@@ -565,22 +789,30 @@ export default function EstimatesPage() {
                   type="button"
                   aria-expanded={!isCollapsed}
                   onClick={() => toggleClassification(cls.code)}
-                  className="bg-[#111111] text-white px-3.5 sm:px-4 py-2.5 min-h-[44px] w-full flex items-center justify-between gap-3 text-left hover:bg-[#1E1E1C] transition-colors"
+                  className="bg-[#111111] text-white px-3.5 sm:px-4 py-2.5 min-h-[44px] w-full flex items-start sm:items-center justify-between gap-3 text-left hover:bg-[#1E1E1C] transition-colors"
                 >
-                  <span className="flex items-center gap-2 min-w-0">
+                  <span className="flex items-start sm:items-center gap-2 min-w-0 flex-1">
                     {isCollapsed ? (
-                      <ChevronRight className="w-4 h-4 shrink-0 text-[#FCAE1A]" aria-hidden="true" />
+                      <ChevronRight
+                        className="w-4 h-4 shrink-0 mt-0.5 sm:mt-0 text-[#FCAE1A]"
+                        aria-hidden="true"
+                      />
                     ) : (
-                      <ChevronDown className="w-4 h-4 shrink-0 text-[#FCAE1A]" aria-hidden="true" />
+                      <ChevronDown
+                        className="w-4 h-4 shrink-0 mt-0.5 sm:mt-0 text-[#FCAE1A]"
+                        aria-hidden="true"
+                      />
                     )}
-                    <span className="text-xs font-display font-bold tracking-wide truncate">
-                      {cls.code} {cls.name}
-                    </span>
-                    <span className="shrink-0 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-white/15 text-[#F4F4F1] tabular-nums">
-                      {cls.activeCount} active
+                    <span className="min-w-0 flex flex-wrap items-center gap-x-2 gap-y-1">
+                      <span className="text-xs font-display font-bold tracking-wide leading-snug break-words">
+                        {cls.code} {cls.name}
+                      </span>
+                      <span className="shrink-0 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-white/15 text-[#F4F4F1] tabular-nums">
+                        {cls.activeCount} active
+                      </span>
                     </span>
                   </span>
-                  <span className="shrink-0 text-xs tabular-nums text-[#FCAE1A] font-semibold">
+                  <span className="shrink-0 text-xs tabular-nums text-[#FCAE1A] font-semibold pt-0.5 sm:pt-0">
                     {formatCurrencyExact(cls.subtotalCents)}
                   </span>
                 </button>
@@ -604,7 +836,7 @@ export default function EstimatesPage() {
                       {/* Mobile Stacked Line Cards (<md) */}
                       <div className="md:hidden divide-y divide-[#E3E3DE]">
                         {cls.visibleLines.map((line) => (
-                          <div key={line.costCode} className="p-3.5 space-y-2">
+                          <div key={line.costCode} className="p-3.5 space-y-2.5">
                             <div className="flex items-start justify-between gap-3">
                               <div className="min-w-0 flex-1 text-xs">
                                 <span className="font-mono font-bold text-[#111111] mr-1.5">
@@ -636,25 +868,33 @@ export default function EstimatesPage() {
                               ) : null}
                             </div>
 
+                            {line.notes ? (
+                              <div className="text-[11px] text-[#5F5F5A] break-words">
+                                Note: {line.notes}
+                              </div>
+                            ) : null}
+
                             {line.competingSubQuotes.length > 1 ? (
                               <div className="flex flex-col gap-2 pt-1">
                                 <div className="text-[10px] font-display uppercase tracking-wider text-[#5F5F5A]">
-                                  Select competing sub quote
+                                  {canBuild ? 'Select competing sub quote' : 'Competing sub quotes'}
                                 </div>
                                 {line.competingSubQuotes.map((q) => {
                                   const selected = line.selectedSubId === q.subId;
-                                  return (
+                                  return canBuild ? (
                                     <button
                                       key={q.subId}
                                       type="button"
+                                      disabled={busyCostCode === line.costCode}
                                       onClick={() =>
-                                        handleSelectCompetingSub(
+                                        void handleSelectCompetingSub(
                                           line.costCode,
                                           q.subId,
+                                          q.subName,
                                           q.totalCents
                                         )
                                       }
-                                      className={`w-full min-h-[44px] flex items-center justify-between gap-2 px-3 py-2 rounded-md border text-xs text-left transition-colors ${
+                                      className={`w-full min-h-[44px] flex items-center justify-between gap-2 px-3 py-2 rounded-md border text-xs text-left disabled:opacity-60 transition-colors ${
                                         selected
                                           ? 'bg-[#111111] text-white border-[#111111] font-semibold'
                                           : 'bg-white text-[#111111] border-[#E3E3DE] hover:border-[#FCAE1A]'
@@ -669,15 +909,40 @@ export default function EstimatesPage() {
                                         {formatCurrencyExact(q.totalCents)}
                                       </span>
                                     </button>
+                                  ) : (
+                                    <div
+                                      key={q.subId}
+                                      className={`w-full flex items-center justify-between gap-2 px-3 py-2 rounded-md border text-xs ${
+                                        selected
+                                          ? 'bg-[#F4F4F1] text-[#111111] border-[#111111] font-semibold'
+                                          : 'bg-white text-[#5F5F5A] border-[#E3E3DE]'
+                                      }`}
+                                    >
+                                      <span className="min-w-0 truncate">{q.subName}</span>
+                                      <span className="shrink-0 tabular-nums">
+                                        {formatCurrencyExact(q.totalCents)}
+                                      </span>
+                                    </div>
                                   );
                                 })}
                               </div>
+                            ) : null}
+
+                            {canBuild ? (
+                              <button
+                                type="button"
+                                onClick={() => openEditLine(line)}
+                                className="w-full min-h-[44px] flex items-center justify-center gap-1.5 rounded-md border border-[#E3E3DE] bg-white text-xs font-display font-semibold text-[#111111] hover:border-[#111111] active:bg-[#F4F4F1] transition-colors"
+                              >
+                                <Pencil className="w-3.5 h-3.5" aria-hidden="true" />
+                                Edit Line
+                              </button>
                             ) : null}
                           </div>
                         ))}
                       </div>
 
-                      {/* Desktop 6-Column Table (md+) */}
+                      {/* Desktop Table (md+) */}
                       <div className="hidden md:block overflow-x-auto">
                         <table className="w-full text-left border-collapse text-xs">
                           <thead>
@@ -688,6 +953,7 @@ export default function EstimatesPage() {
                               <th className="py-2 px-3">Selected Sub / Side-by-Side</th>
                               <th className="py-2 px-3 text-right">Qty / Unit</th>
                               <th className="py-2 px-3 text-right">Extended</th>
+                              {canBuild ? <th className="py-2 px-3 text-right">Edit</th> : null}
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-[#E3E3DE]">
@@ -697,7 +963,12 @@ export default function EstimatesPage() {
                                   {line.costCode}
                                 </td>
                                 <td className="py-2 px-3 font-medium text-[#111111]">
-                                  {line.costCodeName}
+                                  <div>{line.costCodeName}</div>
+                                  {line.notes ? (
+                                    <div className="text-[11px] font-normal text-[#5F5F5A]">
+                                      {line.notes}
+                                    </div>
+                                  ) : null}
                                 </td>
                                 <td className="py-2 px-3">
                                   <span className="px-2 py-0.5 rounded bg-[#F4F4F1] text-[#3B3B38] text-[10px] font-semibold uppercase">
@@ -707,26 +978,42 @@ export default function EstimatesPage() {
                                 <td className="py-2 px-3">
                                   {line.competingSubQuotes.length > 1 ? (
                                     <div className="flex flex-wrap gap-1.5">
-                                      {line.competingSubQuotes.map((q) => (
-                                        <button
-                                          key={q.subId}
-                                          type="button"
-                                          onClick={() =>
-                                            handleSelectCompetingSub(
-                                              line.costCode,
-                                              q.subId,
-                                              q.totalCents
-                                            )
-                                          }
-                                          className={`px-2.5 py-1 rounded border text-[11px] transition-colors ${
-                                            line.selectedSubId === q.subId
-                                              ? 'bg-[#111111] text-white border-[#111111]'
-                                              : 'bg-white border-[#E3E3DE] hover:border-[#FCAE1A]'
-                                          }`}
-                                        >
-                                          {q.subName} ({formatCurrencyExact(q.totalCents)})
-                                        </button>
-                                      ))}
+                                      {line.competingSubQuotes.map((q) => {
+                                        const selected = line.selectedSubId === q.subId;
+                                        return canBuild ? (
+                                          <button
+                                            key={q.subId}
+                                            type="button"
+                                            disabled={busyCostCode === line.costCode}
+                                            onClick={() =>
+                                              void handleSelectCompetingSub(
+                                                line.costCode,
+                                                q.subId,
+                                                q.subName,
+                                                q.totalCents
+                                              )
+                                            }
+                                            className={`px-2.5 py-1 rounded border text-[11px] disabled:opacity-60 transition-colors ${
+                                              selected
+                                                ? 'bg-[#111111] text-white border-[#111111]'
+                                                : 'bg-white border-[#E3E3DE] hover:border-[#FCAE1A]'
+                                            }`}
+                                          >
+                                            {q.subName} ({formatCurrencyExact(q.totalCents)})
+                                          </button>
+                                        ) : (
+                                          <span
+                                            key={q.subId}
+                                            className={`px-2.5 py-1 rounded border text-[11px] ${
+                                              selected
+                                                ? 'bg-[#F4F4F1] text-[#111111] border-[#111111] font-semibold'
+                                                : 'bg-white text-[#5F5F5A] border-[#E3E3DE]'
+                                            }`}
+                                          >
+                                            {q.subName} ({formatCurrencyExact(q.totalCents)})
+                                          </span>
+                                        );
+                                      })}
                                     </div>
                                   ) : (
                                     <span className="text-[#5F5F5A]">
@@ -743,6 +1030,18 @@ export default function EstimatesPage() {
                                 <td className="py-2 px-3 text-right tabular-nums font-semibold text-[#111111] whitespace-nowrap">
                                   {formatCurrencyExact(line.extendedCents)}
                                 </td>
+                                {canBuild ? (
+                                  <td className="py-2 px-3 text-right whitespace-nowrap">
+                                    <button
+                                      type="button"
+                                      onClick={() => openEditLine(line)}
+                                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-[#E3E3DE] bg-white text-[11px] font-display font-semibold text-[#111111] hover:border-[#111111] transition-colors"
+                                    >
+                                      <Pencil className="w-3 h-3" aria-hidden="true" />
+                                      Edit
+                                    </button>
+                                  </td>
+                                ) : null}
                               </tr>
                             ))}
                           </tbody>
@@ -772,6 +1071,159 @@ export default function EstimatesPage() {
           ) : null}
         </div>
       )}
+
+      {/* Edit Estimate Line Modal */}
+      {editDraft && canBuild ? (
+        <div
+          className="fixed inset-0 z-[70] bg-black/50 flex items-end sm:items-center justify-center p-0 sm:p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="edit-estimate-line-title"
+        >
+          <div className="bg-white w-full sm:max-w-lg sm:rounded-xl rounded-t-xl border border-[#E3E3DE] shadow-xl max-h-[92dvh] overflow-y-auto">
+            <div className="flex items-center justify-between gap-3 px-4 sm:px-5 py-3.5 border-b border-[#E3E3DE] sticky top-0 bg-white">
+              <div className="min-w-0">
+                <h2
+                  id="edit-estimate-line-title"
+                  className="text-sm font-display font-bold text-[#111111] truncate"
+                >
+                  Edit {editDraft.costCode} — {editDraft.costCodeName}
+                </h2>
+                <p className="text-[11px] text-[#5F5F5A]">
+                  Update quantity, unit price, or fixed/allowance lump sum.
+                </p>
+              </div>
+              <button
+                type="button"
+                aria-label="Close line editor"
+                onClick={() => setEditDraft(null)}
+                className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-md text-[#5F5F5A] hover:text-[#111111] hover:bg-[#F4F4F1]"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveEditLine} className="p-4 sm:p-5 space-y-4">
+              {editError ? (
+                <div className="bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] px-3.5 py-2.5 rounded-md text-xs">
+                  {editError}
+                </div>
+              ) : null}
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                <div>
+                  <label className="block text-xs font-semibold text-[#111111] mb-1">
+                    Pricing Source
+                  </label>
+                  <select
+                    value={editDraft.pricingSource}
+                    onChange={(e) =>
+                      setEditDraft({
+                        ...editDraft,
+                        pricingSource: e.target.value as PricingSource,
+                      })
+                    }
+                    className="w-full min-h-[44px] border border-[#E3E3DE] bg-white rounded-md px-3 py-2 text-base sm:text-sm text-[#111111]"
+                  >
+                    <option value="sub">Subcontractor</option>
+                    <option value="supplier">Supplier</option>
+                    <option value="fixed">Fixed Amount</option>
+                    <option value="allowance">Allowance</option>
+                    <option value="none">None</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-[#111111] mb-1">Unit</label>
+                  <input
+                    required
+                    value={editDraft.unit}
+                    onChange={(e) => setEditDraft({ ...editDraft, unit: e.target.value })}
+                    placeholder="LS, SF, LF, EA"
+                    className="w-full min-h-[44px] border border-[#E3E3DE] rounded-md px-3 py-2 text-base sm:text-sm text-[#111111]"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                <div>
+                  <label className="block text-xs font-semibold text-[#111111] mb-1">
+                    Quantity
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    step="any"
+                    required
+                    value={editDraft.quantity}
+                    onChange={(e) => setEditDraft({ ...editDraft, quantity: e.target.value })}
+                    className="w-full min-h-[44px] border border-[#E3E3DE] rounded-md px-3 py-2 text-base sm:text-sm text-[#111111] tabular-nums"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-[#111111] mb-1">
+                    Unit Price ($)
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    step="0.01"
+                    value={editDraft.unitPriceDollars}
+                    onChange={(e) =>
+                      setEditDraft({ ...editDraft, unitPriceDollars: e.target.value })
+                    }
+                    className="w-full min-h-[44px] border border-[#E3E3DE] rounded-md px-3 py-2 text-base sm:text-sm text-[#111111] tabular-nums"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-[#111111] mb-1">
+                  Fixed / Allowance Lump Sum ($) <span className="font-normal text-[#5F5F5A]">(optional — overrides Qty × Unit Price)</span>
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  step="0.01"
+                  placeholder="Leave blank to calculate Qty × Unit Price"
+                  value={editDraft.fixedAmountDollars}
+                  onChange={(e) =>
+                    setEditDraft({ ...editDraft, fixedAmountDollars: e.target.value })
+                  }
+                  className="w-full min-h-[44px] border border-[#E3E3DE] rounded-md px-3 py-2 text-base sm:text-sm text-[#111111] tabular-nums"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-[#111111] mb-1">Notes</label>
+                <textarea
+                  rows={2}
+                  value={editDraft.notes}
+                  onChange={(e) => setEditDraft({ ...editDraft, notes: e.target.value })}
+                  placeholder="Scope assumptions, allowance details, or takeoff reference…"
+                  className="w-full border border-[#E3E3DE] rounded-md px-3 py-2 text-base sm:text-sm text-[#111111]"
+                />
+              </div>
+
+              <div className="flex flex-col-reverse sm:flex-row sm:justify-end gap-2.5 pt-2 border-t border-[#E3E3DE]">
+                <button
+                  type="button"
+                  onClick={() => setEditDraft(null)}
+                  className="w-full sm:w-auto min-h-[44px] px-4 py-2 rounded-md border border-[#E3E3DE] bg-white text-xs font-display font-semibold text-[#111111] hover:border-[#111111]"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={savingLine}
+                  className="w-full sm:w-auto min-h-[44px] px-5 py-2 rounded-md bg-[#111111] text-white text-xs font-display font-bold hover:bg-[#FCAE1A] hover:text-[#111111] disabled:opacity-60 transition-colors"
+                >
+                  {savingLine ? 'Saving…' : 'Save Estimate Line'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

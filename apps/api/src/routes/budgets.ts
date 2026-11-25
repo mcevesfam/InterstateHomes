@@ -32,26 +32,117 @@ const fixedLineSchema = z.object({
 });
 
 export async function registerBudgetRoutes(app: FastifyInstance) {
-  app.get('/api/budgets', { schema: { tags: ['Budgets'] } }, async (request) => {
-    const canSeeInternal = canAccess(request.actor.role, 'financials:view_internal');
+  app.get(
+    '/api/budgets',
+    {
+      preHandler: [requirePermission('budgets:view')],
+      schema: { tags: ['Budgets'] },
+    },
+    async (request) => {
+      const canSeeInternal = canAccess(request.actor.role, 'financials:view_internal');
 
-    if (isUsingDemoStore()) {
-      const summaries = demoStore.homes.map((home) => {
-        const est = demoStore.estimates.get(home.id);
-        const pos = demoStore.purchaseOrders.filter((p) => p.homeId === home.id);
-        const fixed = demoStore.fixedBudgetEntries.filter((f) => f.homeId === home.id);
+      if (isUsingDemoStore()) {
+        const summaries = demoStore.homes.map((home) => {
+          const est = demoStore.estimates.get(home.id);
+          const pos = demoStore.purchaseOrders.filter((p) => p.homeId === home.id);
+          const fixed = demoStore.fixedBudgetEntries.filter((f) => f.homeId === home.id);
+          const calc = calculateFinalBudget(
+            (est?.lines ?? [])
+              .filter((l) => canSeeInternal || !INTERNAL_ONLY_COST_CODES.has(l.costCode))
+              .map((l) => ({
+                costCode: l.costCode,
+                costCodeName: l.costCodeName,
+                pricingSource: l.pricingSource,
+                estimatedAmountCents: l.extendedCents,
+                isAllowanceOrFixed: l.isAllowanceOrFixed,
+              })),
+            pos.map((p) => ({ costCode: p.costCode, totalCents: p.totalCents, status: p.status })),
+            fixed.map((f) => ({ costCode: f.costCode, amountCents: f.amountCents }))
+          );
+
+          return {
+            homeId: home.id,
+            homeCode: home.homeCode,
+            planName: home.planName,
+            stage: home.stage,
+            estimateVersion: est?.versionNumber ?? 1,
+            ...calc,
+          };
+        });
+
+        const liveJobCostRows = demoStore.jobCostBudgets.filter(
+          (r) => canSeeInternal || !INTERNAL_ONLY_COST_CODES.has(r.costCode)
+        );
+
+        return {
+          budgets: summaries,
+          liveJobCostRows,
+        };
+      }
+
+      const db = getDb();
+      const [homeRows, estRows, lineRows, codeRows, poRows, fixedRows, liveRows] =
+        await Promise.all([
+          db.select().from(homes).orderBy(desc(homes.createdAt)),
+          db.select().from(estimates).orderBy(desc(estimates.versionNumber)),
+          db.select().from(estimateLines),
+          db.select().from(costCodes),
+          db.select().from(purchaseOrders),
+          db.select().from(homeBudgetFixedLines),
+          db.select().from(jobCostBudgets).orderBy(desc(jobCostBudgets.loadedAt)),
+        ]);
+
+      const codeMap = new Map(codeRows.map((c) => [c.code, c]));
+      const latestEstByHome = new Map<string, typeof estimates.$inferSelect>();
+      for (const e of estRows) {
+        if (!latestEstByHome.has(e.homeId)) {
+          latestEstByHome.set(e.homeId, e);
+        }
+      }
+
+      const linesByEstimate = new Map<string, Array<typeof estimateLines.$inferSelect>>();
+      for (const l of lineRows) {
+        const list = linesByEstimate.get(l.estimateId) ?? [];
+        list.push(l);
+        linesByEstimate.set(l.estimateId, list);
+      }
+
+      const posByHome = new Map<string, Array<typeof purchaseOrders.$inferSelect>>();
+      for (const p of poRows) {
+        const list = posByHome.get(p.homeId) ?? [];
+        list.push(p);
+        posByHome.set(p.homeId, list);
+      }
+
+      const fixedByHome = new Map<string, Array<typeof homeBudgetFixedLines.$inferSelect>>();
+      for (const f of fixedRows) {
+        const list = fixedByHome.get(f.homeId) ?? [];
+        list.push(f);
+        fixedByHome.set(f.homeId, list);
+      }
+
+      const summaries = homeRows.map((home) => {
+        const est = latestEstByHome.get(home.id);
+        const estLines = (est ? (linesByEstimate.get(est.id) ?? []) : [])
+          .filter((l) => canSeeInternal || !INTERNAL_ONLY_COST_CODES.has(l.costCode))
+          .sort(
+            (a, b) =>
+              (codeMap.get(a.costCode)?.sortOrder ?? 999) -
+              (codeMap.get(b.costCode)?.sortOrder ?? 999)
+          );
+        const homePos = posByHome.get(home.id) ?? [];
+        const homeFixed = fixedByHome.get(home.id) ?? [];
+
         const calc = calculateFinalBudget(
-          (est?.lines ?? [])
-            .filter((l) => canSeeInternal || !INTERNAL_ONLY_COST_CODES.has(l.costCode))
-            .map((l) => ({
-              costCode: l.costCode,
-              costCodeName: l.costCodeName,
-              pricingSource: l.pricingSource,
-              estimatedAmountCents: l.extendedCents,
-              isAllowanceOrFixed: l.isAllowanceOrFixed,
-            })),
-          pos.map((p) => ({ costCode: p.costCode, totalCents: p.totalCents, status: p.status })),
-          fixed.map((f) => ({ costCode: f.costCode, amountCents: f.amountCents }))
+          estLines.map((l) => ({
+            costCode: l.costCode,
+            costCodeName: codeMap.get(l.costCode)?.name ?? l.costCode,
+            pricingSource: l.pricingSource as 'sub' | 'supplier' | 'fixed' | 'allowance' | 'none',
+            estimatedAmountCents: l.extendedCents,
+            isAllowanceOrFixed: l.isAllowanceOrFixed,
+          })),
+          homePos.map((p) => ({ costCode: p.costCode, totalCents: p.totalCents, status: p.status })),
+          homeFixed.map((f) => ({ costCode: f.costCode, amountCents: f.amountCents }))
         );
 
         return {
@@ -64,108 +155,25 @@ export async function registerBudgetRoutes(app: FastifyInstance) {
         };
       });
 
-      const liveJobCostRows = demoStore.jobCostBudgets.filter(
-        (r) => canSeeInternal || !INTERNAL_ONLY_COST_CODES.has(r.costCode)
-      );
+      const liveJobCostRows = liveRows
+        .filter((r) => canSeeInternal || !INTERNAL_ONLY_COST_CODES.has(r.costCode))
+        .map((r) => ({
+          homeId: r.homeId,
+          homeCode: r.homeCode,
+          costCode: r.costCode,
+          costCodeName: r.costCodeName,
+          budgetCents: r.budgetCents,
+          source: r.source,
+          loadedAt: r.loadedAt.toISOString(),
+          estimateVersion: r.estimateVersion,
+        }));
 
       return {
         budgets: summaries,
         liveJobCostRows,
       };
     }
-
-    const db = getDb();
-    const [homeRows, estRows, lineRows, codeRows, poRows, fixedRows, liveRows] = await Promise.all([
-      db.select().from(homes).orderBy(desc(homes.createdAt)),
-      db.select().from(estimates).orderBy(desc(estimates.versionNumber)),
-      db.select().from(estimateLines),
-      db.select().from(costCodes),
-      db.select().from(purchaseOrders),
-      db.select().from(homeBudgetFixedLines),
-      db.select().from(jobCostBudgets).orderBy(desc(jobCostBudgets.loadedAt)),
-    ]);
-
-    const codeMap = new Map(codeRows.map((c) => [c.code, c]));
-    const latestEstByHome = new Map<string, typeof estimates.$inferSelect>();
-    for (const e of estRows) {
-      if (!latestEstByHome.has(e.homeId)) {
-        latestEstByHome.set(e.homeId, e);
-      }
-    }
-
-    const linesByEstimate = new Map<string, Array<typeof estimateLines.$inferSelect>>();
-    for (const l of lineRows) {
-      const list = linesByEstimate.get(l.estimateId) ?? [];
-      list.push(l);
-      linesByEstimate.set(l.estimateId, list);
-    }
-
-    const posByHome = new Map<string, Array<typeof purchaseOrders.$inferSelect>>();
-    for (const p of poRows) {
-      const list = posByHome.get(p.homeId) ?? [];
-      list.push(p);
-      posByHome.set(p.homeId, list);
-    }
-
-    const fixedByHome = new Map<string, Array<typeof homeBudgetFixedLines.$inferSelect>>();
-    for (const f of fixedRows) {
-      const list = fixedByHome.get(f.homeId) ?? [];
-      list.push(f);
-      fixedByHome.set(f.homeId, list);
-    }
-
-    const summaries = homeRows.map((home) => {
-      const est = latestEstByHome.get(home.id);
-      const estLines = (est ? (linesByEstimate.get(est.id) ?? []) : [])
-        .filter((l) => canSeeInternal || !INTERNAL_ONLY_COST_CODES.has(l.costCode))
-        .sort(
-          (a, b) =>
-            (codeMap.get(a.costCode)?.sortOrder ?? 999) -
-            (codeMap.get(b.costCode)?.sortOrder ?? 999)
-        );
-      const homePos = posByHome.get(home.id) ?? [];
-      const homeFixed = fixedByHome.get(home.id) ?? [];
-
-      const calc = calculateFinalBudget(
-        estLines.map((l) => ({
-          costCode: l.costCode,
-          costCodeName: codeMap.get(l.costCode)?.name ?? l.costCode,
-          pricingSource: l.pricingSource as 'sub' | 'supplier' | 'fixed' | 'allowance' | 'none',
-          estimatedAmountCents: l.extendedCents,
-          isAllowanceOrFixed: l.isAllowanceOrFixed,
-        })),
-        homePos.map((p) => ({ costCode: p.costCode, totalCents: p.totalCents, status: p.status })),
-        homeFixed.map((f) => ({ costCode: f.costCode, amountCents: f.amountCents }))
-      );
-
-      return {
-        homeId: home.id,
-        homeCode: home.homeCode,
-        planName: home.planName,
-        stage: home.stage,
-        estimateVersion: est?.versionNumber ?? 1,
-        ...calc,
-      };
-    });
-
-    const liveJobCostRows = liveRows
-      .filter((r) => canSeeInternal || !INTERNAL_ONLY_COST_CODES.has(r.costCode))
-      .map((r) => ({
-        homeId: r.homeId,
-        homeCode: r.homeCode,
-        costCode: r.costCode,
-        costCodeName: r.costCodeName,
-        budgetCents: r.budgetCents,
-        source: r.source,
-        loadedAt: r.loadedAt.toISOString(),
-        estimateVersion: r.estimateVersion,
-      }));
-
-    return {
-      budgets: summaries,
-      liveJobCostRows,
-    };
-  });
+  );
 
   app.post(
     '/api/budgets/:homeId/fixed-lines',
@@ -184,9 +192,22 @@ export async function registerBudgetRoutes(app: FastifyInstance) {
       }
       const d = parsed.data;
 
+      if (d.costCode === '00') {
+        return reply.status(400).send({
+          error: 'InvalidCostCode',
+          message: 'Cost code "00" (Uncategorized) cannot carry a budget line.',
+        });
+      }
+
       if (isUsingDemoStore()) {
         const home = demoStore.homes.find((h) => h.id === homeId);
         if (!home) return reply.status(404).send({ error: 'HomeNotFound' });
+        if (home.stage === 'live_budget') {
+          return reply.status(409).send({
+            error: 'BudgetLocked',
+            message: 'This home already has an approved live budget and is locked against direct edits.',
+          });
+        }
         const existing = demoStore.fixedBudgetEntries.find(
           (f) => f.homeId === homeId && f.costCode === d.costCode
         );
@@ -211,13 +232,22 @@ export async function registerBudgetRoutes(app: FastifyInstance) {
           ipAddress: request.ip,
           afterValues: { costCode: d.costCode, amountCents: d.amountCents },
         });
-        return { ok: true, entry: { homeId, costCode: d.costCode, amountCents: d.amountCents, note: d.note } };
+        return {
+          ok: true,
+          entry: { homeId, costCode: d.costCode, amountCents: d.amountCents, note: d.note },
+        };
       }
 
       if (!isValidUuid(homeId)) return reply.status(404).send({ error: 'HomeNotFound' });
       const db = getDb();
       const [home] = await db.select().from(homes).where(eq(homes.id, homeId)).limit(1);
       if (!home) return reply.status(404).send({ error: 'HomeNotFound' });
+      if (home.stage === 'live_budget') {
+        return reply.status(409).send({
+          error: 'BudgetLocked',
+          message: 'This home already has an approved live budget and is locked against direct edits.',
+        });
+      }
 
       const [existing] = await db
         .select()
@@ -325,6 +355,7 @@ export async function registerBudgetRoutes(app: FastifyInstance) {
 
         demoStore.jobCostBudgets.push(...newRows);
         home.stage = 'live_budget';
+        est.status = 'approved';
 
         await writeAuditLog({
           actorUserId: request.actor.userId,

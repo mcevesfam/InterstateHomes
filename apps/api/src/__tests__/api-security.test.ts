@@ -14,6 +14,7 @@ import {
   getDemoSessionByToken,
   resetDemoAuthState,
 } from '../security/auth-plugin.js';
+import { demoStore } from '../data/demo-store.js';
 import { buildApp } from '../app.js';
 
 function extractCookieValue(setCookieHeader: string | string[] | undefined, name: string): string {
@@ -65,10 +66,25 @@ describe('API Integration & RBAC Smoke', () => {
   const origDemoMode = process.env.DEMO_MODE;
   const origDbUrl = process.env.DATABASE_URL;
 
+  const initialPos = structuredClone(demoStore.purchaseOrders);
+  const initialQuotes = structuredClone(demoStore.quotes);
+  const initialSubs = structuredClone(demoStore.subcontractors);
+  const initialUsers = structuredClone(demoStore.users);
+  const initialClarifications = structuredClone(demoStore.clarifications);
+
   beforeEach(() => {
     process.env.DEMO_MODE = 'true';
     delete process.env.DATABASE_URL;
     resetDemoAuthState();
+    demoStore.purchaseOrders.splice(0, demoStore.purchaseOrders.length, ...structuredClone(initialPos));
+    demoStore.quotes.splice(0, demoStore.quotes.length, ...structuredClone(initialQuotes));
+    demoStore.subcontractors.splice(0, demoStore.subcontractors.length, ...structuredClone(initialSubs));
+    demoStore.users.splice(0, demoStore.users.length, ...structuredClone(initialUsers));
+    demoStore.clarifications.splice(
+      0,
+      demoStore.clarifications.length,
+      ...structuredClone(initialClarifications)
+    );
   });
 
   afterEach(() => {
@@ -135,6 +151,396 @@ describe('API Integration & RBAC Smoke', () => {
     expect(adminRefresh.statusCode).toBe(200);
     expect(adminRefresh.json().ok).toBe(true);
     expect(adminRefresh.json().rowsWritten).toBeGreaterThan(0);
+
+    await app.close();
+  });
+
+  it('blocks feedback screenshot bucket IDOR on chat and ticket creation', async () => {
+    const app = await buildApp();
+
+    // Arbitrary bucket key (e.g. another sub's W-9) must be rejected with 403
+    const chatIdor = await app.inject({
+      method: 'POST',
+      url: '/api/feedback/chat',
+      headers: { 'x-demo-role': 'subcontractor', 'x-demo-sub-id': 'sub-red-cliffs' },
+      payload: {
+        messages: [{ senderType: 'user', body: 'Look at this screenshot' }],
+        pageContext: { pathname: '/portal', section: 'Portal' },
+        screenshotStorageKey: 'compliance/sub-hurricane-plumbing/w9.pdf',
+      },
+    });
+    expect(chatIdor.statusCode).toBe(403);
+    expect(chatIdor.json().error).toBe('ForbiddenScreenshotKey');
+
+    const createIdor = await app.inject({
+      method: 'POST',
+      url: '/api/feedback',
+      headers: { 'x-demo-role': 'subcontractor', 'x-demo-sub-id': 'sub-red-cliffs' },
+      payload: {
+        category: 'bug',
+        severity: 'low',
+        title: 'Attempted arbitrary key attach',
+        description: 'Trying to read another vendor compliance PDF via screenshot key.',
+        pageContext: { pathname: '/portal', section: 'Portal' },
+        screenshotStorageKey: 'feedback-screenshots/usr-chase/1700000000000-abcdef123456.png',
+      },
+    });
+    expect(createIdor.statusCode).toBe(403);
+    expect(createIdor.json().error).toBe('ForbiddenScreenshotKey');
+
+    await app.close();
+  });
+
+  it('blocks PO compliance bypass via spoofed poType, internal/00 cost codes, and split-scope without override', async () => {
+    const app = await buildApp();
+
+    // Passing poType: "supplier" for a subcontractor with expired COI must be rejected (422 InvalidPoType)
+    const bypassRes = await app.inject({
+      method: 'POST',
+      url: '/api/purchase-orders',
+      headers: { 'x-demo-role': 'estimator_approver' },
+      payload: {
+        homeId: 'home-ch-14',
+        costCode: '19',
+        subId: 'sub-hurricane-plumbing',
+        poType: 'supplier',
+        scopeSummary: 'Attempting compliance bypass via supplier poType',
+        totalCents: 2150000,
+      },
+    });
+    expect(bypassRes.statusCode).toBe(422);
+    expect(bypassRes.json().error).toBe('InvalidPoType');
+
+    // Internal-only cost code (93 Profit) & non-estimateable "00" must be blocked on POs and Quotes
+    const internalPo = await app.inject({
+      method: 'POST',
+      url: '/api/purchase-orders',
+      headers: { 'x-demo-role': 'admin' },
+      payload: {
+        homeId: 'home-ch-14',
+        costCode: '93',
+        subId: 'sub-red-cliffs',
+        poType: 'subcontractor',
+        scopeSummary: 'Invalid profit PO',
+        totalCents: 100000,
+      },
+    });
+    expect(internalPo.statusCode).toBe(400);
+    expect(internalPo.json().error).toBe('InvalidCostCode');
+
+    const zeroCodeQuote = await app.inject({
+      method: 'POST',
+      url: '/api/quotes',
+      headers: { 'x-demo-role': 'estimator_approver' },
+      payload: {
+        homeId: 'home-ch-14',
+        subCompanyId: 'sub-red-cliffs',
+        costCode: '00',
+        responseDeadline: '2026-12-31',
+        quotedTotalCents: 100000,
+      },
+    });
+    expect(zeroCodeQuote.statusCode).toBe(400);
+    expect(zeroCodeQuote.json().error).toBe('InvalidCostCode');
+
+    // Issuing a second PO of same poType on same (homeId, costCode) requires splitScopeOverrideReason
+    const duplicatePo = await app.inject({
+      method: 'POST',
+      url: '/api/purchase-orders',
+      headers: { 'x-demo-role': 'estimator_approver' },
+      payload: {
+        homeId: 'home-ch-14',
+        costCode: '22',
+        subId: 'sub-red-rock-framing',
+        poType: 'subcontractor',
+        scopeSummary: 'Second framing PO without split-scope reason',
+        totalCents: 500000,
+      },
+    });
+    expect(duplicatePo.statusCode).toBe(422);
+    expect(duplicatePo.json().error).toBe('SplitScopeOverrideRequired');
+
+    await app.close();
+  });
+
+  it('enforces dual-signature PO flow and blocks PM/estimator forgery or re-signing', async () => {
+    const app = await buildApp();
+
+    // po-ch14-20-01 is pending_sub_signature for sub-zion-electric
+    // PM, estimator, and wrong subcontractor MUST be blocked (403)
+    const pmForge = await app.inject({
+      method: 'POST',
+      url: '/api/purchase-orders/po-ch14-20-01/sign',
+      headers: { 'x-demo-role': 'project_manager' },
+    });
+    expect(pmForge.statusCode).toBe(403);
+
+    const estForge = await app.inject({
+      method: 'POST',
+      url: '/api/purchase-orders/po-ch14-20-01/sign',
+      headers: { 'x-demo-role': 'estimator_approver' },
+    });
+    expect(estForge.statusCode).toBe(403);
+
+    const wrongSubForge = await app.inject({
+      method: 'POST',
+      url: '/api/purchase-orders/po-ch14-20-01/sign',
+      headers: { 'x-demo-role': 'subcontractor', 'x-demo-sub-id': 'sub-red-cliffs' },
+    });
+    expect(wrongSubForge.statusCode).toBe(403);
+
+    // Assigned subcontractor (sub-zion-electric) CAN sign pending_sub_signature -> pending_approver_signature
+    const subSign = await app.inject({
+      method: 'POST',
+      url: '/api/purchase-orders/po-ch14-20-01/sign',
+      headers: { 'x-demo-role': 'subcontractor', 'x-demo-sub-id': 'sub-zion-electric' },
+    });
+    expect(subSign.statusCode).toBe(200);
+    expect(subSign.json().purchaseOrder.status).toBe('pending_approver_signature');
+
+    // Subcontractor CANNOT counter-sign as approver
+    const subDoubleSign = await app.inject({
+      method: 'POST',
+      url: '/api/purchase-orders/po-ch14-20-01/sign',
+      headers: { 'x-demo-role': 'subcontractor', 'x-demo-sub-id': 'sub-zion-electric' },
+    });
+    expect(subDoubleSign.statusCode).toBe(403);
+
+    // Approver CAN sign pending_approver_signature -> fully_signed
+    const approverSign = await app.inject({
+      method: 'POST',
+      url: '/api/purchase-orders/po-ch14-20-01/sign',
+      headers: { 'x-demo-role': 'estimator_approver' },
+    });
+    expect(approverSign.statusCode).toBe(200);
+    expect(approverSign.json().purchaseOrder.status).toBe('fully_signed');
+
+    // Re-signing a fully_signed PO returns 409 InvalidPoState
+    const resign = await app.inject({
+      method: 'POST',
+      url: '/api/purchase-orders/po-ch14-20-01/sign',
+      headers: { 'x-demo-role': 'admin' },
+    });
+    expect(resign.statusCode).toBe(409);
+    expect(resign.json().error).toBe('InvalidPoState');
+
+    await app.close();
+  });
+
+  it('enforces subcontractor read/write isolation and quote state machine', async () => {
+    const app = await buildApp();
+
+    // Subcontractor blocked from internal estimates, budgets, competitor compliance, and admin settings
+    expect(
+      (
+        await app.inject({
+          method: 'GET',
+          url: '/api/homes/home-ch-14/estimate',
+          headers: { 'x-demo-role': 'subcontractor', 'x-demo-sub-id': 'sub-red-cliffs' },
+        })
+      ).statusCode
+    ).toBe(403);
+
+    expect(
+      (
+        await app.inject({
+          method: 'GET',
+          url: '/api/budgets',
+          headers: { 'x-demo-role': 'subcontractor', 'x-demo-sub-id': 'sub-red-cliffs' },
+        })
+      ).statusCode
+    ).toBe(403);
+
+    expect(
+      (
+        await app.inject({
+          method: 'GET',
+          url: '/api/subcontractors/sub-hurricane-plumbing/compliance-check?costCode=19',
+          headers: { 'x-demo-role': 'subcontractor', 'x-demo-sub-id': 'sub-red-cliffs' },
+        })
+      ).statusCode
+    ).toBe(403);
+
+    expect(
+      (
+        await app.inject({
+          method: 'GET',
+          url: '/api/admin/settings',
+          headers: { 'x-demo-role': 'subcontractor', 'x-demo-sub-id': 'sub-red-cliffs' },
+        })
+      ).statusCode
+    ).toBe(403);
+
+    // Invalid numeric costCode "3" rejected on compliance-check
+    expect(
+      (
+        await app.inject({
+          method: 'GET',
+          url: '/api/subcontractors/sub-red-cliffs/compliance-check?costCode=3',
+          headers: { 'x-demo-role': 'admin' },
+        })
+      ).statusCode
+    ).toBe(400);
+
+    // Subcontractor with empty subCompanyId NEVER falls through to internal dashboard
+    const emptySubDash = await app.inject({
+      method: 'GET',
+      url: '/api/dashboard/summary',
+      headers: { 'x-demo-role': 'subcontractor', 'x-demo-sub-id': '' },
+    });
+    expect(emptySubDash.statusCode).toBe(200);
+    expect(emptySubDash.json().kpis.activeHomes).toBe(0);
+    expect(emptySubDash.json().activeHomes).toHaveLength(0);
+
+    // Subcontractor & PM cannot create subcontractor companies
+    expect(
+      (
+        await app.inject({
+          method: 'POST',
+          url: '/api/subcontractors',
+          headers: { 'x-demo-role': 'project_manager' },
+          payload: {
+            legalName: 'Rogue Sub LLC',
+            companyType: 'subcontractor',
+            costCodesServed: ['31'],
+          },
+        })
+      ).statusCode
+    ).toBe(403);
+
+    // Quote counter RBAC & state machine: PM cannot forge counter; finalized quote cannot be re-countered or re-decided
+    const pmCounter = await app.inject({
+      method: 'POST',
+      url: '/api/quotes/q-lk22-20/counter',
+      headers: { 'x-demo-role': 'project_manager' },
+      payload: { proposedTotalCents: 1_500_000, comment: 'Forged counter' },
+    });
+    expect(pmCounter.statusCode).toBe(403);
+
+    // Assigned sub (sub-zion-electric) accepts q-lk22-20 directly
+    const subAccept = await app.inject({
+      method: 'POST',
+      url: '/api/quotes/q-lk22-20/accept',
+      headers: { 'x-demo-role': 'subcontractor', 'x-demo-sub-id': 'sub-zion-electric' },
+    });
+    expect(subAccept.statusCode).toBe(200);
+    expect(subAccept.json().quote.status).toBe('accepted');
+
+    // Trying to decide or counter an already-accepted quote returns 409
+    const redecide = await app.inject({
+      method: 'POST',
+      url: '/api/quotes/q-lk22-20/decision',
+      headers: { 'x-demo-role': 'estimator_approver' },
+      payload: { decision: 'reject' },
+    });
+    expect(redecide.statusCode).toBe(409);
+
+    await app.close();
+  });
+
+  it('supports compliance upload/review, admin user creation/unlock, and self-service password change', async () => {
+    const app = await buildApp();
+    const defaultPassword = process.env.INITIAL_ADMIN_PASSWORD ?? 'ChangeMe-Interstate2026!';
+
+    // 1. Subcontractor uploads a new W-9 compliance doc -> pending, TIN masked
+    const uploadRes = await app.inject({
+      method: 'POST',
+      url: '/api/subcontractors/sub-red-cliffs/compliance-docs',
+      headers: { 'x-demo-role': 'subcontractor', 'x-demo-sub-id': 'sub-red-cliffs' },
+      payload: {
+        docType: 'w9',
+        fileName: 'RedCliffs-W9-2026.pdf',
+        w9Tin: '87-9991234',
+      },
+    });
+    expect(uploadRes.statusCode).toBe(201);
+    const docId = uploadRes.json().document.id as string;
+    expect(uploadRes.json().document.reviewStatus).toBe('pending');
+    expect(uploadRes.json().document.w9TinMasked).toBe('***-**-1234');
+
+    // 2. Admin approves the uploaded doc
+    const reviewRes = await app.inject({
+      method: 'PATCH',
+      url: `/api/subcontractors/sub-red-cliffs/compliance-docs/${docId}/review`,
+      headers: { 'x-demo-role': 'admin' },
+      payload: { reviewStatus: 'approved' },
+    });
+    expect(reviewRes.statusCode).toBe(200);
+    expect(reviewRes.json().document.reviewStatus).toBe('approved');
+
+    // 3. Admin creates a new user & unlocks a locked user
+    const createUserRes = await app.inject({
+      method: 'POST',
+      url: '/api/admin/users',
+      headers: { 'x-demo-role': 'admin' },
+      payload: {
+        email: 'new.estimator@interstatehomes.com',
+        fullName: 'New Estimator',
+        role: 'estimator_approver',
+        password: 'StrongPassword2026!',
+        approvalLimitCents: 10_000_000,
+      },
+    });
+    expect(createUserRes.statusCode).toBe(201);
+    const createdUserId = createUserRes.json().user.id as string;
+
+    const lockRes = await app.inject({
+      method: 'PATCH',
+      url: `/api/admin/users/${createdUserId}`,
+      headers: { 'x-demo-role': 'admin' },
+      payload: { status: 'locked' },
+    });
+    expect(lockRes.statusCode).toBe(200);
+    expect(lockRes.json().user.status).toBe('locked');
+
+    const unlockRes = await app.inject({
+      method: 'PATCH',
+      url: `/api/admin/users/${createdUserId}`,
+      headers: { 'x-demo-role': 'admin' },
+      payload: { unlock: true },
+    });
+    expect(unlockRes.statusCode).toBe(200);
+    expect(unlockRes.json().user.status).toBe('active');
+    expect(unlockRes.json().user.failedLoginAttempts).toBe(0);
+
+    // 4. Self-service password change via cookie session
+    const loginRes = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      payload: { email: 'chase@interstatehomes.com', password: defaultPassword },
+    });
+    const token = extractCookieValue(loginRes.headers['set-cookie'], SESSION_COOKIE_NAME);
+
+    const weakPwd = await app.inject({
+      method: 'POST',
+      url: '/api/auth/change-password',
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${token}` },
+      payload: { currentPassword: defaultPassword, newPassword: 'short' },
+    });
+    expect(weakPwd.statusCode).toBe(400);
+
+    const changeOk = await app.inject({
+      method: 'POST',
+      url: '/api/auth/change-password',
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${token}` },
+      payload: { currentPassword: defaultPassword, newPassword: 'RotatedSecurePassword2026!' },
+    });
+    expect(changeOk.statusCode).toBe(200);
+
+    // Old password now fails; new password logs in cleanly
+    const oldFail = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      payload: { email: 'chase@interstatehomes.com', password: defaultPassword },
+    });
+    expect(oldFail.statusCode).toBe(401);
+
+    const newOk = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      payload: { email: 'chase@interstatehomes.com', password: 'RotatedSecurePassword2026!' },
+    });
+    expect(newOk.statusCode).toBe(200);
 
     await app.close();
   });
@@ -238,7 +644,7 @@ describe('API Integration & RBAC Smoke', () => {
     expect(unlockedMe.statusCode).toBe(200);
     expect(unlockedMe.json().user.mfaEnabled).toBe(true);
 
-    // 5. Reauth enforcement before PO signing
+    // 5. Reauth enforcement before PO signing (po-ch14-22-01 is pending_approver_signature)
     const memSess = getDemoSessionByToken(pendingToken)!;
     memSess.lastReauthAt = Date.now() - 20 * 60_000; // stale (> 15 min)
 
