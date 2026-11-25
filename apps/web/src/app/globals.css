@@ -20,12 +20,50 @@ body {
   color: var(--ink);
   font-family: var(--font-body), "Nunito Sans", "Segoe UI", sans-serif;
   -webkit-font-smoothing: antialiased;
+  overflow-x: clip;
+  caret-color: var(--ink);
+}
+
+::selection {
+  background-color: rgba(252, 174, 26, 0.35);
+  color: var(--ink);
 }
 
 h1, h2, h3, h4, .font-display {
   font-family: var(--font-display), "Montserrat", "Avenir Next", "Segoe UI", sans-serif;
 }
 
+button, a {
+  touch-action: manipulation;
+}
+
+:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 2px;
+}
+
 .tabular-nums {
   font-variant-numeric: tabular-nums;
+}
+
+.safe-bottom {
+  padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
+}
+
+@media (max-width: 767px) {
+  input,
+  select,
+  textarea {
+    font-size: 16px;
+  }
+}
+
+@media print {
+  [data-print-hide="true"] {
+    display: none !important;
+  }
+
+  body {
+    background: #ffffff !important;
+  }
 }

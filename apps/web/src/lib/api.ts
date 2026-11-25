@@ -1,4 +1,12 @@
 import type { UserRole } from '@interstate/shared';
+import { recordNetworkEvent } from './telemetry';
+
+function generateRequestId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `req-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
 
 function buildApiUrl(path: string): string {
   const normalized = path.startsWith('/') ? path : `/${path}`;
@@ -36,18 +44,74 @@ export async function apiFetch<T>(
     requestHeaders.set('x-demo-sub-id', subCompanyId);
   }
 
-  const res = await fetch(buildApiUrl(path), {
-    ...rest,
-    credentials: 'include',
-    headers: requestHeaders,
-    cache: 'no-store',
-  });
+  const isBrowser = typeof window !== 'undefined';
+  const requestId =
+    requestHeaders.get('x-request-id') || (isBrowser ? generateRequestId() : '');
+  if (requestId && !requestHeaders.has('x-request-id')) {
+    requestHeaders.set('x-request-id', requestId);
+  }
+
+  const startMs = isBrowser ? performance.now() : 0;
+  const method = (rest.method ?? 'GET').toUpperCase();
+  const targetUrl = buildApiUrl(path);
+
+  let res: Response;
+  try {
+    res = await fetch(targetUrl, {
+      ...rest,
+      credentials: 'include',
+      headers: requestHeaders,
+      cache: 'no-store',
+    });
+  } catch (err) {
+    if (isBrowser) {
+      recordNetworkEvent({
+        timestamp: new Date().toISOString(),
+        requestId: requestId || 'network-error',
+        method,
+        path,
+        status: 0,
+        durationMs: Math.round(performance.now() - startMs),
+        ok: false,
+        errorMessage: err instanceof Error ? err.message : 'Network failure',
+      });
+    }
+    throw err;
+  }
+
+  const durationMs = isBrowser ? Math.round(performance.now() - startMs) : 0;
+  const echoedRequestId = res.headers.get('x-request-id') || requestId || 'unknown';
 
   if (!res.ok) {
     const errBody = await res.json().catch(() => ({ message: res.statusText }));
-    throw Object.assign(new Error(errBody.message ?? errBody.error ?? 'API request failed'), {
+    const message = errBody.message ?? errBody.error ?? 'API request failed';
+    if (isBrowser) {
+      recordNetworkEvent({
+        timestamp: new Date().toISOString(),
+        requestId: echoedRequestId,
+        method,
+        path,
+        status: res.status,
+        durationMs,
+        ok: false,
+        errorMessage: message,
+      });
+    }
+    throw Object.assign(new Error(message), {
       status: res.status,
       data: errBody,
+    });
+  }
+
+  if (isBrowser) {
+    recordNetworkEvent({
+      timestamp: new Date().toISOString(),
+      requestId: echoedRequestId,
+      method,
+      path,
+      status: res.status,
+      durationMs,
+      ok: true,
     });
   }
 

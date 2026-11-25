@@ -14,6 +14,7 @@ const FORWARDED_REQUEST_HEADERS = [
   'authorization',
   'x-demo-role',
   'x-demo-sub-id',
+  'x-request-id',
   'x-forwarded-for',
   'x-forwarded-proto',
   'user-agent',
@@ -54,6 +55,10 @@ async function proxyRequest(request: NextRequest, context: RouteContext): Promis
     }
   }
 
+  const requestId =
+    request.headers.get('x-request-id')?.trim() || crypto.randomUUID();
+  headers.set('x-request-id', requestId);
+
   let body: ArrayBuffer | undefined;
   if (request.method !== 'GET' && request.method !== 'HEAD') {
     const rawBody = await request.arrayBuffer();
@@ -77,7 +82,7 @@ async function proxyRequest(request: NextRequest, context: RouteContext): Promis
     console.error('[api-proxy] Upstream request failed:', upstreamUrl.toString(), err);
     return NextResponse.json(
       { error: 'UpstreamUnavailable', message: 'Unable to reach Interstate Homes API service.' },
-      { status: 502 }
+      { status: 502, headers: { 'x-request-id': requestId } }
     );
   }
 
@@ -87,6 +92,9 @@ async function proxyRequest(request: NextRequest, context: RouteContext): Promis
       responseHeaders.append(key, value);
     }
   });
+  if (!responseHeaders.has('x-request-id')) {
+    responseHeaders.set('x-request-id', requestId);
+  }
 
   const getSetCookie = (upstreamRes.headers as Headers & { getSetCookie?: () => string[] }).getSetCookie;
   if (typeof getSetCookie === 'function') {

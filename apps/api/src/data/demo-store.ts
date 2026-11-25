@@ -2,6 +2,14 @@ import {
   COST_CODES,
   DEFAULT_SYSTEM_SETTINGS,
   type ComplianceDocRecord,
+  type DiagnosticSnapshot,
+  type FeedbackCategory,
+  type FeedbackFixPlanDTO,
+  type FeedbackMessageDTO,
+  type FeedbackSeverity,
+  type FeedbackStatus,
+  type GithubDispatchStatus,
+  type PageContext,
   type SystemSettingsConfig,
   type UserRole,
 } from '@interstate/shared';
@@ -171,6 +179,36 @@ export interface DemoAuditLog {
   beforeValues: Record<string, unknown> | null;
   afterValues: Record<string, unknown> | null;
   createdAt: string;
+}
+
+export interface DemoFeedbackItem {
+  id: string;
+  ticketKey: string;
+  category: FeedbackCategory;
+  severity: FeedbackSeverity;
+  status: FeedbackStatus;
+  title: string;
+  description: string;
+  reporterUserId: string | null;
+  reporterEmail: string;
+  reporterName: string;
+  reporterRole: string;
+  subCompanyId: string | null;
+  pagePath: string;
+  pageTitle: string | null;
+  pageContext: PageContext;
+  diagnosticSnapshot: DiagnosticSnapshot;
+  screenshotStorageKey: string | null;
+  resolutionNote: string | null;
+  adminNotes: string | null;
+  githubIssueNumber: number | null;
+  githubIssueUrl: string | null;
+  githubDispatchStatus: GithubDispatchStatus;
+  approvedByUserId: string | null;
+  approvedAt: string | null;
+  resolvedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 const SUBDIVISION_NAMES: Record<string, string> = {
@@ -510,6 +548,11 @@ export interface DemoStore {
   }>;
   clarifications: DemoClarification[];
   auditLogs: DemoAuditLog[];
+  feedbackItems: DemoFeedbackItem[];
+  feedbackMessages: FeedbackMessageDTO[];
+  feedbackFixPlans: FeedbackFixPlanDTO[];
+  feedbackScreenshots: Map<string, { contentType: string; buffer: Buffer }>;
+  nextFeedbackSeq: number;
   helper: {
     getSubdivisionName: (code: string) => string;
   };
@@ -855,6 +898,281 @@ export const demoStore: DemoStore = {
       createdAt: '2026-11-15T14:22:00Z',
     },
   ],
+  feedbackItems: [
+    {
+      id: 'fb-demo-101',
+      ticketKey: 'FB-101',
+      category: 'bug',
+      severity: 'high',
+      status: 'plan_ready',
+      title: 'PO compliance block banner lacks direct link to expired COI upload',
+      description:
+        'When issuing a Purchase Order for Hurricane Valley Plumbing on CH 14 (cost code 19), the 422 compliance error explains the expired COI but does not link directly to the Compliance review row for that subcontractor.',
+      reporterUserId: 'usr-amanda',
+      reporterEmail: 'amanda@interstatehomes.com',
+      reporterName: 'Amanda Miller',
+      reporterRole: 'estimator_approver',
+      subCompanyId: null,
+      pagePath: '/purchase-orders',
+      pageTitle: 'Purchase Orders | Interstate Homes',
+      pageContext: {
+        pathname: '/purchase-orders',
+        section: 'Purchase Orders',
+        entityType: 'subcontractor',
+        entityId: 'sub-hurricane-plumbing',
+        entityLabel: 'Hurricane Valley Plumbing & Mechanical LLC',
+        summary: {
+          homeCode: 'CH 14',
+          costCode: '19',
+          poCount: 2,
+          lastErrorStatus: 422,
+        },
+        appRole: 'estimator_approver',
+        authMode: 'demo',
+      },
+      diagnosticSnapshot: {
+        clientLogs: [
+          {
+            timestamp: '2026-11-24T15:12:04Z',
+            level: 'warn',
+            message: 'POST /api/purchase-orders returned 422 ComplianceBlocked for sub-hurricane-plumbing',
+          },
+        ],
+        networkEvents: [
+          {
+            timestamp: '2026-11-24T15:12:04Z',
+            requestId: 'demo-req-po-422',
+            method: 'POST',
+            path: '/api/purchase-orders',
+            status: 422,
+            durationMs: 18,
+            ok: false,
+            errorMessage: 'General Liability COI expired 2026-11-10',
+          },
+        ],
+        breadcrumbs: [
+          { timestamp: '2026-11-24T15:11:40Z', type: 'navigation', label: 'Navigated to /purchase-orders', path: '/purchase-orders' },
+          { timestamp: '2026-11-24T15:12:02Z', type: 'click', label: 'Issue PO (Cost Code 19)' },
+        ],
+        requestIds: ['demo-req-po-422'],
+        serverLogs: [
+          {
+            timestamp: '2026-11-24T15:12:04Z',
+            requestId: 'demo-req-po-422',
+            method: 'POST',
+            route: '/api/purchase-orders',
+            statusCode: 422,
+            durationMs: 14,
+            errorCode: 'ComplianceBlocked',
+            errorMessage: 'PO blocked: COI expired 2026-11-10 for sub-hurricane-plumbing',
+          },
+        ],
+        capturedAt: '2026-11-24T15:12:18Z',
+      },
+      screenshotStorageKey: null,
+      resolutionNote: null,
+      adminNotes: null,
+      githubIssueNumber: null,
+      githubIssueUrl: null,
+      githubDispatchStatus: 'not_dispatched',
+      approvedByUserId: null,
+      approvedAt: null,
+      resolvedAt: null,
+      createdAt: '2026-11-24T15:12:30Z',
+      updatedAt: '2026-11-24T15:12:35Z',
+    },
+    {
+      id: 'fb-demo-102',
+      ticketKey: 'FB-102',
+      category: 'feature',
+      severity: 'medium',
+      status: 'deployed',
+      title: 'Export visible job cost budget lines to CSV from /budgets',
+      description:
+        'Field Project Managers need a quick CSV export of the visible cost code budget rows on /budgets without exposing internal land/margin lines.',
+      reporterUserId: 'usr-super',
+      reporterEmail: 'super@interstatehomes.com',
+      reporterName: 'Derek Bradshaw',
+      reporterRole: 'project_manager',
+      subCompanyId: null,
+      pagePath: '/budgets',
+      pageTitle: 'Budgets | Interstate Homes',
+      pageContext: {
+        pathname: '/budgets',
+        section: 'Budgets',
+        entityType: 'home',
+        entityId: 'home-ps-11',
+        entityLabel: 'PS 11',
+        summary: { stage: 'live_budget', visibleRows: 3 },
+        appRole: 'project_manager',
+        authMode: 'demo',
+      },
+      diagnosticSnapshot: {
+        clientLogs: [],
+        networkEvents: [
+          {
+            timestamp: '2026-11-22T17:04:11Z',
+            requestId: 'demo-req-budget-get',
+            method: 'GET',
+            path: '/api/budgets/home-ps-11',
+            status: 200,
+            durationMs: 11,
+            ok: true,
+          },
+        ],
+        breadcrumbs: [
+          { timestamp: '2026-11-22T17:04:10Z', type: 'navigation', label: 'Navigated to /budgets', path: '/budgets' },
+        ],
+        requestIds: ['demo-req-budget-get'],
+        serverLogs: [],
+        capturedAt: '2026-11-22T17:05:00Z',
+      },
+      screenshotStorageKey: null,
+      resolutionNote:
+        'Shipped CSV export scoped strictly to server-projected visible budget rows so PM financial redaction rules remain intact.',
+      adminNotes: 'Approved & verified against PM financial redaction test.',
+      githubIssueNumber: null,
+      githubIssueUrl: null,
+      githubDispatchStatus: 'not_configured',
+      approvedByUserId: 'usr-chase',
+      approvedAt: '2026-11-22T18:10:00Z',
+      resolvedAt: '2026-11-23T10:30:00Z',
+      createdAt: '2026-11-22T17:05:10Z',
+      updatedAt: '2026-11-23T10:30:00Z',
+    },
+  ],
+  feedbackMessages: [
+    {
+      id: 'fbm-demo-1',
+      feedbackItemId: 'fb-demo-101',
+      senderType: 'user',
+      senderUserId: 'usr-amanda',
+      senderName: 'Amanda Miller',
+      body: 'Issuing a PO for Hurricane Valley Plumbing gave a 422 COI error, but there is no link to jump straight to their compliance record.',
+      visibleToReporter: true,
+      createdAt: '2026-11-24T15:12:30Z',
+    },
+    {
+      id: 'fbm-demo-2',
+      feedbackItemId: 'fb-demo-101',
+      senderType: 'assistant',
+      senderUserId: null,
+      senderName: 'Interstate Feedback Assistant',
+      body: 'Captured your /purchase-orders context and correlated the 422 ComplianceBlocked response for Hurricane Valley Plumbing. An AI fix plan is ready for Admin review.',
+      visibleToReporter: true,
+      createdAt: '2026-11-24T15:12:35Z',
+    },
+    {
+      id: 'fbm-demo-3',
+      feedbackItemId: 'fb-demo-102',
+      senderType: 'user',
+      senderUserId: 'usr-super',
+      senderName: 'Derek Bradshaw',
+      body: 'Can we add a CSV download button on the Budgets page for field tracking?',
+      visibleToReporter: true,
+      createdAt: '2026-11-22T17:05:10Z',
+    },
+    {
+      id: 'fbm-demo-4',
+      feedbackItemId: 'fb-demo-102',
+      senderType: 'admin',
+      senderUserId: 'usr-chase',
+      senderName: 'Chase Stratton',
+      body: 'Shipped CSV export scoped strictly to server-projected visible budget rows so PM financial redaction rules remain intact.',
+      visibleToReporter: true,
+      createdAt: '2026-11-23T10:30:00Z',
+    },
+  ],
+  feedbackFixPlans: [
+    {
+      id: 'fbp-demo-101-v1',
+      feedbackItemId: 'fb-demo-101',
+      version: 1,
+      modelName: 'gemini-2.5-flash',
+      summary:
+        'Add a contextual "Open Compliance Record" link inside the Purchase Orders compliance-blocked alert banner using the blocked subCompanyId returned by POST /api/purchase-orders.',
+      rootCauseOrGoal:
+        'The 422 ComplianceBlocked response already identifies the failing subcontractor, but apps/web/src/app/purchase-orders/page.tsx renders only a plain text error banner without a deep link to /compliance?subId=...',
+      affectedFiles: [
+        {
+          path: 'apps/web/src/app/purchase-orders/page.tsx',
+          reason: 'Render a Link to /compliance?subId=<id> inside the 422 compliance error banner.',
+          changeType: 'modify',
+        },
+        {
+          path: 'apps/web/src/app/compliance/page.tsx',
+          reason: 'Read optional subId query param on mount to highlight/filter the target subcontractor row.',
+          changeType: 'modify',
+        },
+        {
+          path: 'apps/api/src/routes/purchase-orders.ts',
+          reason: 'Include subCompanyId in 422 ComplianceBlocked error payload for deterministic UI linking.',
+          changeType: 'modify',
+        },
+      ],
+      schemaChanges: [],
+      securityRbacImpact:
+        'No RBAC relaxation: /compliance remains gated by existing subcontractor scoping, and PO issuance still enforces compliance server-side.',
+      implementationSteps: [
+        {
+          order: 1,
+          title: 'Include subCompanyId in 422 error payload',
+          details: 'Return subCompanyId alongside blockers in apps/api/src/routes/purchase-orders.ts when COI/W-9/MSA gating fails.',
+        },
+        {
+          order: 2,
+          title: 'Add deep link in PO alert banner',
+          details: 'In apps/web/src/app/purchase-orders/page.tsx, show a Next.js Link to /compliance?subId=... when err.data?.subCompanyId is present.',
+        },
+        {
+          order: 3,
+          title: 'Support ?subId filter on Compliance page',
+          details: 'Read searchParams.get("subId") in apps/web/src/app/compliance/page.tsx and highlight the matching vendor.',
+        },
+      ],
+      verificationSteps: [
+        'Run npm run test --workspace=@interstate/api to verify existing Scenario 5 COI PO blocking tests pass.',
+        'Trigger Scenario 5 on /purchase-orders in browser and click the Compliance link to verify it lands on Hurricane Valley Plumbing.',
+      ],
+      riskLevel: 'low',
+      estimatedEffort: 'xs',
+      revisionFeedback: null,
+      status: 'pending_approval',
+      createdAt: '2026-11-24T15:12:35Z',
+    },
+    {
+      id: 'fbp-demo-102-v1',
+      feedbackItemId: 'fb-demo-102',
+      version: 1,
+      modelName: 'gemini-2.5-flash',
+      summary: 'Generate CSV client-side exclusively from the server-redacted /api/budgets/:homeId payload.',
+      rootCauseOrGoal: 'Field PMs need offline CSV snapshots without bypassing server-side internal financial redaction.',
+      affectedFiles: [
+        {
+          path: 'apps/web/src/app/budgets/page.tsx',
+          reason: 'Add Export CSV button iterating over already-projected rows.',
+          changeType: 'modify',
+        },
+      ],
+      schemaChanges: [],
+      securityRbacImpact: 'Preserves PM financial redaction because 00L/88/92/93 and soldAmountCents are absent from API output.',
+      implementationSteps: [
+        {
+          order: 1,
+          title: 'Add CSV serializer helper',
+          details: 'Escape CSV cells and download visible rows for the active home.',
+        },
+      ],
+      verificationSteps: ['Verify exported CSV as project_manager excludes internal profit/land codes.'],
+      riskLevel: 'low',
+      estimatedEffort: 'xs',
+      revisionFeedback: null,
+      status: 'approved',
+      createdAt: '2026-11-22T17:06:00Z',
+    },
+  ],
+  feedbackScreenshots: new Map(),
+  nextFeedbackSeq: 103,
   helper: {
     getSubdivisionName: (code: string) => SUBDIVISION_NAMES[code] ?? code,
   },

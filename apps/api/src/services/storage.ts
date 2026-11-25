@@ -113,3 +113,33 @@ export async function getPresignedDownloadUrl(
   const url = await getSignedUrl(client, command, { expiresIn });
   return { url, expiresIn };
 }
+
+export async function uploadBufferToStorage(
+  storageKey: string,
+  buffer: Buffer,
+  contentType: string
+): Promise<{ provider: 'gcs' | 's3' | 'mock'; storageKey: string }> {
+  const gcs = getGcsStorage();
+  if (gcs) {
+    await gcs.bucket(process.env.GCS_BUCKET!).file(storageKey).save(buffer, {
+      contentType,
+      resumable: false,
+    });
+    return { provider: 'gcs', storageKey };
+  }
+
+  const client = getS3Client();
+  if (client) {
+    await client.send(
+      new PutObjectCommand({
+        Bucket: process.env.S3_BUCKET!,
+        Key: storageKey,
+        Body: buffer,
+        ContentType: contentType,
+      })
+    );
+    return { provider: 's3', storageKey };
+  }
+
+  return { provider: 'mock', storageKey };
+}

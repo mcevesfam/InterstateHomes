@@ -140,30 +140,27 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="min-h-screen grid lg:grid-cols-[440px_1fr] bg-[#F4F4F1] text-[#111111]">
+    <div className="min-h-[100dvh] grid lg:grid-cols-[440px_1fr] bg-[#F4F4F1] text-[#111111]">
       {/* Brand Panel */}
-      <aside className="bg-[#111111] text-white p-8 lg:p-10 flex flex-col justify-between border-b lg:border-b-0 lg:border-r border-[#2C2C2A] relative overflow-hidden">
-        {/* Subtle architectural amber top bar */}
+      <aside className="bg-[#111111] text-white px-5 py-6 sm:p-8 lg:p-10 flex flex-col justify-between border-b lg:border-b-0 lg:border-r border-[#2C2C2A] relative overflow-hidden">
+        {/* Architectural amber top bar */}
         <div className="absolute inset-x-0 top-0 h-1 bg-[#FCAE1A]" />
 
-        <div className="space-y-8">
+        <div className="space-y-5 lg:space-y-8">
           <InterstateLogo variant="dark" />
 
-          <div className="space-y-3 pt-4">
-            <div className="text-[11px] font-display font-semibold uppercase tracking-[0.16em] text-[#FCAE1A]">
-              Southern Utah Operations Platform
-            </div>
-            <h1 className="font-display text-2xl lg:text-[26px] font-bold tracking-tight leading-snug text-white">
+          <div className="space-y-2.5 lg:space-y-3 pt-1 lg:pt-4">
+            <h1 className="font-display text-xl sm:text-2xl lg:text-[26px] font-bold tracking-tight leading-snug text-white">
               Estimating, Subcontracts &amp; Live Job Cost Budgets
             </h1>
             <p className="text-sm text-[#C9CED8] leading-relaxed">
               Authorized access for Interstate Homes estimators, project managers, administrators,
-              and verified trade partners.
+              and verified trade partners across Southern Utah.
             </p>
           </div>
         </div>
 
-        <div className="mt-10 pt-6 border-t border-[#2C2C2A] space-y-3 text-xs text-[#9D9D97]">
+        <div className="hidden lg:block mt-10 pt-6 border-t border-[#2C2C2A] space-y-3 text-xs text-[#9D9D97]">
           <div className="flex items-center gap-2.5">
             <ShieldCheck className="w-4 h-4 text-[#FCAE1A] shrink-0" />
             <span>Role-based access control &amp; immutable audit logging</span>
@@ -179,21 +176,21 @@ export default function LoginPage() {
       </aside>
 
       {/* Sign-In Form Canvas */}
-      <main className="flex items-center justify-center p-6 sm:p-10">
-        <div className="w-full max-w-md space-y-6">
+      <main className="flex items-start lg:items-center justify-center px-4 py-6 sm:p-10 safe-bottom">
+        <div className="w-full max-w-md space-y-5">
           {authMode === 'demo' && !loading ? (
-            <div className="rounded-lg border border-[#FCAE1A]/40 bg-[#FFF9EB] px-4 py-3 text-xs text-[#5F4200] flex items-center justify-between gap-3">
+            <div className="rounded-lg border border-[#FCAE1A]/40 bg-[#FFF9EB] px-4 py-2 text-xs text-[#5F4200] flex items-center justify-between gap-3">
               <span>Running in local Demo Mode.</span>
               <Link
                 href="/"
-                className="font-display font-semibold text-[#111111] underline underline-offset-2 hover:text-[#8A5A00] shrink-0"
+                className="min-h-[44px] inline-flex items-center font-display font-semibold text-[#111111] underline underline-offset-2 hover:text-[#8A5A00] shrink-0"
               >
                 Open Dashboard
               </Link>
             </div>
           ) : null}
 
-          <div className="bg-white border border-[#E3E3DE] rounded-xl shadow-sm p-7 sm:p-8">
+          <div className="bg-white border border-[#E3E3DE] rounded-xl shadow-sm p-5 sm:p-8">
             {step === 'credentials' ? (
               <>
                 <div className="mb-6">
@@ -232,7 +229,7 @@ export default function LoginPage() {
                       onChange={(e) => setEmail(e.target.value)}
                       placeholder="name@interstatehomes.com"
                       disabled={submitting}
-                      className="w-full rounded-lg border border-[#D4D4CE] bg-white px-3.5 py-2.5 text-sm text-[#111111] placeholder:text-[#9D9D97] focus:outline-none focus:border-[#111111] focus:ring-2 focus:ring-[#FCAE1A]/40 disabled:opacity-60"
+                      className="w-full min-h-[44px] rounded-lg border border-[#D4D4CE] bg-white px-3.5 py-2.5 text-sm text-[#111111] placeholder:text-[#767670] focus:outline-none focus:border-[#111111] focus:ring-2 focus:ring-[#FCAE1A]/40 disabled:opacity-60"
                     />
                   </div>
 
@@ -253,13 +250,13 @@ export default function LoginPage() {
                         onChange={(e) => setPassword(e.target.value)}
                         placeholder="Enter your password"
                         disabled={submitting}
-                        className="w-full rounded-lg border border-[#D4D4CE] bg-white pl-3.5 pr-10 py-2.5 text-sm text-[#111111] placeholder:text-[#9D9D97] focus:outline-none focus:border-[#111111] focus:ring-2 focus:ring-[#FCAE1A]/40 disabled:opacity-60"
+                        className="w-full min-h-[44px] rounded-lg border border-[#D4D4CE] bg-white pl-3.5 pr-12 py-2.5 text-sm text-[#111111] placeholder:text-[#767670] focus:outline-none focus:border-[#111111] focus:ring-2 focus:ring-[#FCAE1A]/40 disabled:opacity-60"
                       />
                       <button
                         type="button"
                         onClick={() => setShowPassword((prev) => !prev)}
                         aria-label={showPassword ? 'Hide password' : 'Show password'}
-                        className="absolute inset-y-0 right-0 px-3 flex items-center text-[#5F5F5A] hover:text-[#111111] cursor-pointer"
+                        className="absolute inset-y-0 right-0 min-w-[44px] min-h-[44px] flex items-center justify-center text-[#5F5F5A] hover:text-[#111111] cursor-pointer"
                       >
                         {showPassword ? (
                           <EyeOff className="w-4 h-4" />
@@ -273,7 +270,7 @@ export default function LoginPage() {
                   <button
                     type="submit"
                     disabled={submitting}
-                    className="w-full mt-2 rounded-lg bg-[#111111] hover:bg-[#262624] text-white font-display text-sm font-semibold py-2.5 px-4 transition-colors focus:outline-none focus:ring-2 focus:ring-[#FCAE1A] focus:ring-offset-2 disabled:opacity-60 cursor-pointer flex items-center justify-center gap-2"
+                    className="w-full min-h-[44px] mt-2 rounded-lg bg-[#111111] hover:bg-[#262624] text-white font-display text-sm font-semibold py-2.5 px-4 transition-colors focus:outline-none focus:ring-2 focus:ring-[#FCAE1A] focus:ring-offset-2 disabled:opacity-60 cursor-pointer flex items-center justify-center gap-2"
                   >
                     <span className="inline-block w-2 h-2 rounded-full bg-[#FCAE1A]" />
                     <span>{submitting ? 'Signing in…' : 'Sign In'}</span>
@@ -291,7 +288,7 @@ export default function LoginPage() {
                   </h2>
                   <p className="text-sm text-[#5F5F5A] mt-1">
                     Enter the 6-digit code from your authenticator app for{' '}
-                    <span className="font-semibold text-[#111111]">{pendingEmail}</span>.
+                    <span className="font-semibold text-[#111111] break-all">{pendingEmail}</span>.
                   </p>
                 </div>
 
@@ -326,14 +323,14 @@ export default function LoginPage() {
                       onChange={(e) => setMfaCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
                       placeholder="000000"
                       disabled={submitting}
-                      className="w-full rounded-lg border border-[#D4D4CE] bg-white px-4 py-3 text-center font-mono text-2xl tracking-[0.4em] tabular-nums text-[#111111] placeholder:text-[#C9C9C2] focus:outline-none focus:border-[#111111] focus:ring-2 focus:ring-[#FCAE1A]/40 disabled:opacity-60"
+                      className="w-full min-h-[48px] rounded-lg border border-[#D4D4CE] bg-white px-4 py-3 text-center font-mono text-xl sm:text-2xl tracking-[0.28em] sm:tracking-[0.4em] tabular-nums text-[#111111] placeholder:text-[#9D9D97] focus:outline-none focus:border-[#111111] focus:ring-2 focus:ring-[#FCAE1A]/40 disabled:opacity-60"
                     />
                   </div>
 
                   <button
                     type="submit"
                     disabled={submitting || mfaCode.length !== 6}
-                    className="w-full rounded-lg bg-[#FCAE1A] hover:bg-[#E59B0C] text-[#111111] font-display text-sm font-bold py-2.5 px-4 transition-colors focus:outline-none focus:ring-2 focus:ring-[#111111] focus:ring-offset-2 disabled:opacity-50 cursor-pointer"
+                    className="w-full min-h-[44px] rounded-lg bg-[#FCAE1A] hover:bg-[#E59B0C] text-[#111111] font-display text-sm font-bold py-2.5 px-4 transition-colors focus:outline-none focus:ring-2 focus:ring-[#111111] focus:ring-offset-2 disabled:opacity-50 cursor-pointer"
                   >
                     {submitting ? 'Verifying…' : 'Verify & Continue'}
                   </button>
@@ -342,7 +339,7 @@ export default function LoginPage() {
                     type="button"
                     onClick={handleBackToCredentials}
                     disabled={submitting}
-                    className="w-full flex items-center justify-center gap-1.5 py-2 text-xs font-semibold text-[#5F5F5A] hover:text-[#111111] transition-colors cursor-pointer"
+                    className="w-full min-h-[44px] flex items-center justify-center gap-1.5 py-2 text-xs font-semibold text-[#5F5F5A] hover:text-[#111111] transition-colors cursor-pointer"
                   >
                     <ArrowLeft className="w-3.5 h-3.5" />
                     <span>Back to sign in</span>
@@ -354,6 +351,9 @@ export default function LoginPage() {
 
           <p className="text-center text-xs text-[#5F5F5A]">
             Sessions automatically lock after inactivity per Interstate Homes security policy.
+          </p>
+          <p className="lg:hidden text-center text-[11px] text-[#75756F]">
+            &copy; {new Date().getFullYear()} Interstate Homes &bull; St. George, Utah
           </p>
         </div>
       </main>

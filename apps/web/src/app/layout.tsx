@@ -1,12 +1,25 @@
-import type { Metadata } from 'next';
+import type { Metadata, Viewport } from 'next';
 import './globals.css';
 import { RoleProvider } from '@/lib/role-context';
+import { PageContextProvider } from '@/lib/page-context';
 import { AppShell } from '@/components/AppShell';
+
+export const viewport: Viewport = {
+  width: 'device-width',
+  initialScale: 1,
+  viewportFit: 'cover',
+  themeColor: '#111111',
+};
 
 export const metadata: Metadata = {
   title: 'Interstate Homes — Estimating, Subcontract & Budget Software',
   description:
     'Internal estimating, subcontractor compliance, purchase orders, and live job cost budget platform for Interstate Homes.',
+  appleWebApp: {
+    capable: true,
+    title: 'Interstate Homes',
+    statusBarStyle: 'black-translucent',
+  },
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
@@ -22,7 +35,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       </head>
       <body>
         <RoleProvider>
-          <AppShell>{children}</AppShell>
+          <PageContextProvider>
+            <AppShell>{children}</AppShell>
+          </PageContextProvider>
         </RoleProvider>
       </body>
     </html>

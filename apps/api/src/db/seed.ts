@@ -110,25 +110,32 @@ async function seed() {
     .toLowerCase();
   const initialAdminPassword =
     process.env.INITIAL_ADMIN_PASSWORD ?? 'ChangeMe-Interstate2026!';
-  const passwordHash = await hashPassword(initialAdminPassword);
 
-  await db
-    .insert(users)
-    .values({
-      email: initialAdminEmail,
-      fullName: 'Chase Stratton',
-      role: 'admin',
-      subCompanyId: null,
-      isSubCompanyAdmin: false,
-      passwordHash,
-      mfaEnabled: false,
-      status: 'active',
-      failedLoginAttempts: 0,
-    })
-    .onConflictDoNothing({ target: users.email });
+  const initialAdmins = [
+    { email: initialAdminEmail, fullName: 'Chase Stratton' },
+    { email: 'michael@mcdesignco.com', fullName: 'Michael' },
+  ];
+
+  for (const admin of initialAdmins) {
+    const passwordHash = await hashPassword(initialAdminPassword);
+    await db
+      .insert(users)
+      .values({
+        email: admin.email,
+        fullName: admin.fullName,
+        role: 'admin',
+        subCompanyId: null,
+        isSubCompanyAdmin: false,
+        passwordHash,
+        mfaEnabled: false,
+        status: 'active',
+        failedLoginAttempts: 0,
+      })
+      .onConflictDoNothing({ target: users.email });
+  }
 
   console.log(
-    `Seeded ${COST_CLASSIFICATIONS.length} classifications, ${COST_CODES.length} cost codes, ${INITIAL_SUBDIVISIONS.length} subdivisions, default system settings, and initial admin (${initialAdminEmail}).`
+    `Seeded ${COST_CLASSIFICATIONS.length} classifications, ${COST_CODES.length} cost codes, ${INITIAL_SUBDIVISIONS.length} subdivisions, default system settings, and initial admins (${initialAdmins.map((a) => a.email).join(', ')}).`
   );
   await closeDb();
 }

@@ -4,6 +4,7 @@ import React, { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { ROLE_LABELS } from '@interstate/shared';
 import { apiFetch, formatCurrency } from '@/lib/api';
+import { usePageContext } from '@/lib/page-context';
 import { useRole } from '@/lib/role-context';
 
 interface DashboardSummary {
@@ -62,6 +63,20 @@ export default function DashboardPage() {
   const [data, setData] = useState<DashboardSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  usePageContext({
+    section: 'Dashboard',
+    entityType: 'workspace',
+    entityLabel: data ? `${data.kpis.activeHomes} Active Homes` : 'Executive Overview',
+    summary: data
+      ? {
+          activeHomes: data.kpis.activeHomes,
+          quotesOut: data.kpis.quotesOut,
+          posAwaitingSign: data.kpis.posAwaitingSign,
+          complianceAlerts: data.kpis.complianceAlerts,
+        }
+      : undefined,
+  });
+
   useEffect(() => {
     let active = true;
     apiFetch<DashboardSummary>('/api/dashboard/summary', { role, subCompanyId })
@@ -88,8 +103,8 @@ export default function DashboardPage() {
   return (
     <div className="space-y-5">
       {/* Header matching wireframe */}
-      <div className="flex flex-wrap items-end justify-between gap-4">
-        <div>
+      <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-end justify-between gap-4">
+        <div className="min-w-0">
           <div className="text-xs text-[#5F5F5A]">
             {todayLabel} · Signed in as {ROLE_LABELS[role]}
           </div>
@@ -98,16 +113,16 @@ export default function DashboardPage() {
           </h1>
         </div>
         {role !== 'subcontractor' && role !== 'project_manager' ? (
-          <div className="flex items-center gap-2.5">
+          <div className="flex flex-col sm:flex-row w-full sm:w-auto items-stretch sm:items-center gap-2.5">
             <Link
               href="/homes?intake=1"
-              className="px-3.5 py-2 rounded-md border border-[#E3E3DE] bg-white text-xs font-display font-semibold text-[#111111] hover:border-[#111111] transition-colors"
+              className="w-full sm:w-auto min-h-[44px] flex items-center justify-center px-3.5 py-2 rounded-md border border-[#E3E3DE] bg-white text-xs font-display font-semibold text-[#111111] hover:border-[#111111] active:bg-[#F4F4F1] transition-colors"
             >
               New Plan Intake
             </Link>
             <Link
               href="/estimates"
-              className="px-4 py-2 rounded-md bg-[#FCAE1A] text-xs font-display font-bold text-[#111111] hover:bg-[#111111] hover:text-white transition-colors"
+              className="w-full sm:w-auto min-h-[44px] flex items-center justify-center px-4 py-2 rounded-md bg-[#FCAE1A] text-xs font-display font-bold text-[#111111] hover:bg-[#111111] hover:text-white active:bg-[#111111] active:text-white transition-colors"
             >
               + Open Estimate Builder
             </Link>
@@ -116,13 +131,13 @@ export default function DashboardPage() {
       </div>
 
       {error ? (
-        <div className="bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] px-4 py-3 rounded-lg text-sm">
+        <div className="bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] px-4 py-3 rounded-lg text-sm break-words">
           API connection note: {error}. Start the API server with <code>npm run dev:api</code>.
         </div>
       ) : null}
 
       {/* Top 6 KPI Strip */}
-      <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3.5">
+      <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3 sm:gap-3.5">
         {[
           { label: 'Active homes', value: data?.kpis.activeHomes ?? '—', sub: 'In workflow' },
           { label: 'Quotes out', value: data?.kpis.quotesOut ?? '—', sub: 'Awaiting sub reply' },
@@ -133,13 +148,13 @@ export default function DashboardPage() {
         ].map((kpi) => (
           <div
             key={kpi.label}
-            className="bg-white border border-[#E3E3DE] rounded-lg px-4 py-3.5 shadow-[0_1px_2px_rgba(0,0,0,0.02)]"
+            className="min-w-0 bg-white border border-[#E3E3DE] rounded-lg px-3.5 py-3 sm:px-4 sm:py-3.5 shadow-[0_1px_2px_rgba(0,0,0,0.02)]"
           >
-            <div className="text-xs text-[#5F5F5A]">{kpi.label}</div>
+            <div className="text-xs text-[#5F5F5A] truncate">{kpi.label}</div>
             <div className="text-2xl font-display font-bold text-[#111111] mt-1 tabular-nums">
               {kpi.value}
             </div>
-            <div className="text-[11px] text-[#5F5F5A] mt-0.5">{kpi.sub}</div>
+            <div className="text-[11px] text-[#5F5F5A] mt-0.5 leading-snug">{kpi.sub}</div>
           </div>
         ))}
       </div>
@@ -148,9 +163,9 @@ export default function DashboardPage() {
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
         {/* Needs Attention */}
         <section className="lg:col-span-6 bg-white border border-[#E3E3DE] rounded-lg overflow-hidden">
-          <div className="flex items-center justify-between px-4 py-3 border-b border-[#E3E3DE]">
+          <div className="flex items-center justify-between gap-2 px-4 py-3 border-b border-[#E3E3DE]">
             <h2 className="text-sm font-display font-bold text-[#111111]">Needs attention</h2>
-            <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-[#FEF3C7] text-[#8A5A00]">
+            <span className="shrink-0 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-[#FEF3C7] text-[#8A5A00] tabular-nums">
               {data?.needsAttention.length ?? 0} open
             </span>
           </div>
@@ -159,7 +174,7 @@ export default function DashboardPage() {
               <Link
                 key={item.id}
                 href={item.href}
-                className="flex items-start gap-3 px-4 py-3 hover:bg-[#F4F4F1]/60 transition-colors"
+                className="flex items-start gap-3 px-4 py-3.5 min-h-[44px] hover:bg-[#F4F4F1]/60 active:bg-[#F4F4F1] transition-colors"
               >
                 <span
                   className={`shrink-0 mt-0.5 text-[10px] font-display font-bold px-2 py-0.5 rounded border ${
@@ -168,11 +183,11 @@ export default function DashboardPage() {
                 >
                   {item.badge}
                 </span>
-                <div className="min-w-0">
-                  <div className="text-[13px] font-semibold text-[#111111] leading-snug">
+                <div className="min-w-0 flex-1">
+                  <div className="text-[13px] font-semibold text-[#111111] leading-snug break-words">
                     {item.title}
                   </div>
-                  <div className="text-xs text-[#5F5F5A] mt-0.5">{item.subtitle}</div>
+                  <div className="text-xs text-[#5F5F5A] mt-0.5 break-words">{item.subtitle}</div>
                 </div>
               </Link>
             ))}
@@ -184,18 +199,63 @@ export default function DashboardPage() {
           </div>
         </section>
 
-        {/* Active Homes Table */}
+        {/* Active Homes */}
         <section className="lg:col-span-6 bg-white border border-[#E3E3DE] rounded-lg overflow-hidden">
-          <div className="flex items-center justify-between px-4 py-3 border-b border-[#E3E3DE]">
+          <div className="flex items-center justify-between gap-2 px-4 py-3 border-b border-[#E3E3DE]">
             <h2 className="text-sm font-display font-bold text-[#111111]">Active homes</h2>
             <Link
               href="/homes"
-              className="text-xs font-semibold text-[#8A5A00] hover:underline"
+              className="text-xs font-semibold text-[#8A5A00] hover:underline py-1"
             >
               View all homes
             </Link>
           </div>
-          <div className="overflow-x-auto">
+
+          {/* Mobile Compact Home Cards (<sm) */}
+          <div className="sm:hidden divide-y divide-[#E3E3DE]">
+            {(data?.activeHomes ?? []).map((home) => {
+              const pill = STAGE_PILLS[home.stage] ?? STAGE_PILLS.plan_intake;
+              return (
+                <Link
+                  key={home.id}
+                  href={`/estimates?homeId=${home.id}`}
+                  className="block px-4 py-3.5 min-h-[44px] active:bg-[#F4F4F1] hover:bg-[#F4F4F1]/50 transition-colors"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-display font-bold text-sm text-[#111111]">
+                      {home.homeCode}
+                    </span>
+                    <span
+                      className={`shrink-0 inline-block text-[11px] font-semibold px-2.5 py-0.5 rounded-full ${pill.cls}`}
+                    >
+                      {pill.label}
+                    </span>
+                  </div>
+                  <div className="text-[13px] font-medium text-[#111111] mt-1">
+                    {home.planName}{' '}
+                    <span className="text-[#5F5F5A] font-normal">· {home.subdivisionName}</span>
+                  </div>
+                  <div className="flex items-center justify-between gap-2 text-xs text-[#5F5F5A] mt-1 tabular-nums">
+                    <span>{home.planRevision}</span>
+                    <span>POs signed: {home.posSignedLabel}</span>
+                  </div>
+                </Link>
+              );
+            })}
+            {role === 'subcontractor' ? (
+              <div className="py-8 px-4 text-center text-xs text-[#5F5F5A]">
+                Subcontractor Portal view shows only your assigned quotes and POs.
+              </div>
+            ) : null}
+            {data && role !== 'subcontractor' && data.activeHomes.length === 0 ? (
+              <div className="py-8 px-4 text-center text-xs text-[#5F5F5A]">
+                No active homes in workflow yet.
+              </div>
+            ) : null}
+          </div>
+
+          {/* Desktop/Tablet Table (sm+) */}
+          <div className="hidden sm:block overflow-x-auto">
             <table className="w-full text-left border-collapse">
               <thead>
                 <tr className="border-b border-[#E3E3DE] bg-[#F4F4F1]/70 text-[10px] font-display uppercase tracking-wider text-[#5F5F5A]">
@@ -224,7 +284,7 @@ export default function DashboardPage() {
                       <td className="py-2.5 px-3 tabular-nums text-[#3B3B38]">
                         {home.posSignedLabel}
                       </td>
-                      <td className="py-2.5 px-4 text-right">
+                      <td className="py-2.5 px-4 text-right whitespace-nowrap">
                         <span
                           className={`inline-block text-[11px] font-semibold px-2.5 py-0.5 rounded-full ${pill.cls}`}
                         >
@@ -250,20 +310,20 @@ export default function DashboardPage() {
       {/* Bottom 5-Stage Pipeline Strip matching wireframe */}
       {role !== 'subcontractor' ? (
         <section className="bg-white border border-[#E3E3DE] rounded-lg p-4">
-          <div className="flex items-center justify-between mb-3">
+          <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 mb-3">
             <h2 className="text-sm font-display font-bold text-[#111111]">Homes pipeline</h2>
             <span className="text-xs text-[#5F5F5A]">
               Plans-to-budget single-pass workflow (Section 2)
             </span>
           </div>
-          <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+          <div className="flex overflow-x-auto snap-x gap-2.5 pb-1 md:grid md:grid-cols-5 md:gap-3 md:pb-0">
             {(data?.pipeline ?? []).map((stage) => (
               <Link
                 key={stage.stage}
                 href="/homes"
-                className="border border-[#E3E3DE] rounded-md p-3 hover:border-[#FCAE1A] transition-colors bg-[#F4F4F1]/30"
+                className="shrink-0 md:shrink min-w-[145px] md:min-w-0 snap-start border border-[#E3E3DE] rounded-md p-3 hover:border-[#FCAE1A] active:bg-[#F4F4F1] transition-colors bg-[#F4F4F1]/30"
               >
-                <div className="text-xs text-[#5F5F5A]">{stage.label}</div>
+                <div className="text-xs text-[#5F5F5A] truncate">{stage.label}</div>
                 <div className="text-xl font-display font-bold text-[#111111] mt-1 tabular-nums">
                   {stage.count}
                 </div>

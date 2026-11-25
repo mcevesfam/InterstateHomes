@@ -31,7 +31,10 @@ export type Permission =
   | 'budgets:view'
   | 'financials:view_internal' // Margin, profit (93), land (00L), real estate fees (88), overhead (92), sold amount
   | 'clarifications:view'
-  | 'clarifications:create';
+  | 'clarifications:create'
+  | 'feedback:create'
+  | 'feedback:view_own'
+  | 'feedback:manage';
 
 const ROLE_PERMISSIONS: Record<UserRole, Set<Permission>> = {
   admin: new Set<Permission>([
@@ -57,6 +60,9 @@ const ROLE_PERMISSIONS: Record<UserRole, Set<Permission>> = {
     'financials:view_internal',
     'clarifications:view',
     'clarifications:create',
+    'feedback:create',
+    'feedback:view_own',
+    'feedback:manage',
   ]),
   estimator_approver: new Set<Permission>([
     // Cannot change agreement templates, user roles, or edit signed quote pricing
@@ -75,12 +81,16 @@ const ROLE_PERMISSIONS: Record<UserRole, Set<Permission>> = {
     'financials:view_internal',
     'clarifications:view',
     'clarifications:create',
+    'feedback:create',
+    'feedback:view_own',
   ]),
   project_manager: new Set<Permission>([
     // Superintendents/field: view budget, POs, signed agreements; log clarifications; NO margin/profit/land/sold or approvals
     'budgets:view',
     'clarifications:view',
     'clarifications:create',
+    'feedback:create',
+    'feedback:view_own',
   ]),
   subcontractor: new Set<Permission>([
     // Only own company records
@@ -90,6 +100,8 @@ const ROLE_PERMISSIONS: Record<UserRole, Set<Permission>> = {
     'pos:sign_sub',
     'clarifications:view',
     'clarifications:create',
+    'feedback:create',
+    'feedback:view_own',
   ]),
   homeowner: new Set<Permission>([]),
 };

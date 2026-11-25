@@ -19,27 +19,29 @@ export default function CostCodesPage() {
   });
 
   return (
-    <div className="space-y-5">
-      <div className="flex flex-wrap items-center justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-display font-bold text-[#111111]">
+    <div className="space-y-5 min-w-0">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="min-w-0">
+          <h1 className="text-xl sm:text-2xl font-display font-bold text-[#111111]">
             Master Cost Codes ({COST_CODES.length} Codes / {COST_CLASSIFICATIONS.length} Classifications)
           </h1>
           <p className="text-xs text-[#5F5F5A] mt-0.5">
             Section 7 &amp; Business Rule 12 — Stored strictly as text everywhere (e.g. &quot;03&quot;, &quot;00L&quot;).
           </p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex flex-col sm:flex-row w-full sm:w-auto gap-2 shrink-0">
           <input
+            aria-label="Filter cost codes or trades"
             placeholder="Filter code or trade..."
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            className="border border-[#E3E3DE] bg-white rounded-md px-3 py-1.5 text-xs"
+            className="w-full sm:w-48 min-h-[44px] sm:min-h-[38px] border border-[#E3E3DE] bg-white rounded-md px-3 py-2 text-xs text-[#111111]"
           />
           <select
+            aria-label="Filter by cost classification"
             value={clsFilter}
             onChange={(e) => setClsFilter(e.target.value)}
-            className="border border-[#E3E3DE] bg-white rounded-md px-3 py-1.5 text-xs"
+            className="w-full sm:w-auto min-h-[44px] sm:min-h-[38px] border border-[#E3E3DE] bg-white rounded-md px-3 py-2 text-xs text-[#111111]"
           >
             <option value="all">All 11 Classifications</option>
             {COST_CLASSIFICATIONS.map((c) => (
@@ -51,7 +53,69 @@ export default function CostCodesPage() {
         </div>
       </div>
 
-      <div className="bg-white border border-[#E3E3DE] rounded-lg overflow-hidden">
+      {/* Mobile Cost-Code Cards */}
+      <div className="md:hidden space-y-3">
+        {filtered.length === 0 ? (
+          <div className="bg-white border border-[#E3E3DE] rounded-lg p-5 text-xs text-[#5F5F5A] text-center">
+            No cost codes match your search or classification filter.
+          </div>
+        ) : (
+          filtered.map((cc) => (
+            <div
+              key={cc.code}
+              className="bg-white border border-[#E3E3DE] rounded-lg p-4 space-y-2.5 text-xs"
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="font-mono font-bold text-xs px-2 py-0.5 rounded bg-[#F4F4F1] text-[#111111] shrink-0">
+                    {cc.code}
+                  </span>
+                  <span className="font-display font-bold text-sm text-[#111111] break-words min-w-0">
+                    {cc.name}
+                  </span>
+                </div>
+                {cc.isInternalOnly ? (
+                  <span className="shrink-0 px-2 py-0.5 rounded bg-[#111111] text-[#FCAE1A] text-[10px] font-semibold whitespace-nowrap">
+                    Internal Only
+                  </span>
+                ) : (
+                  <span className="shrink-0 text-[11px] text-[#5F5F5A]">Standard</span>
+                )}
+              </div>
+
+              <div className="grid grid-cols-1 gap-1.5 pt-2 border-t border-[#E3E3DE]">
+                <div className="flex items-baseline justify-between gap-2">
+                  <span className="text-[10px] font-display uppercase text-[#5F5F5A] shrink-0">
+                    Classification
+                  </span>
+                  <span className="text-[#3B3B38] text-right break-words">
+                    {cc.classificationCode} {cc.classificationName}
+                  </span>
+                </div>
+                <div className="flex items-baseline justify-between gap-2">
+                  <span className="text-[10px] font-display uppercase text-[#5F5F5A] shrink-0">
+                    Pricing Sources
+                  </span>
+                  <span className="uppercase text-[10px] font-semibold text-[#111111] text-right">
+                    {cc.pricingSources.join(' / ')}
+                  </span>
+                </div>
+                <div className="pt-1">
+                  <div className="text-[10px] font-display uppercase text-[#5F5F5A]">
+                    Allowed Sub-Lines
+                  </div>
+                  <div className="text-[#5F5F5A] mt-0.5 break-words">
+                    {cc.allowedSubLines.join(', ') || '—'}
+                  </div>
+                </div>
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+
+      {/* Desktop 6-Column Cost-Codes Table */}
+      <div className="hidden md:block overflow-x-auto bg-white border border-[#E3E3DE] rounded-lg">
         <table className="w-full text-left border-collapse text-xs">
           <thead>
             <tr className="border-b border-[#E3E3DE] bg-[#F4F4F1] text-[10px] font-display uppercase text-[#5F5F5A]">
@@ -76,7 +140,7 @@ export default function CostCodesPage() {
                 </td>
                 <td className="py-2.5 px-3">
                   {cc.isInternalOnly ? (
-                    <span className="px-2 py-0.5 rounded bg-[#111111] text-[#FCAE1A] text-[10px] font-semibold">
+                    <span className="px-2 py-0.5 rounded bg-[#111111] text-[#FCAE1A] text-[10px] font-semibold whitespace-nowrap">
                       Internal Only
                     </span>
                   ) : (
