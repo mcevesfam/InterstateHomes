@@ -1,0 +1,41 @@
+name: Deploy Staging (Cloud Run us-west1)
+
+on:
+  push:
+    branches:
+      - staging
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy-staging:
+    name: Build, Migrate & Deploy Staging
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/1072600078136/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: github-actions-deployer@interstate-homes-app.iam.gserviceaccount.com
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Submit Cloud Build (Staging)
+        run: |
+          gcloud builds submit . \
+            --project=interstate-homes-app \
+            --region=us-west1 \
+            --config=cloudbuild.yaml \
+            --substitutions="_ENV=staging,_REGION=us-west1,_REPO=interstate-homes,_API_SERVICE=interstate-api-staging,_WEB_SERVICE=interstate-web-staging,_MIGRATE_JOB=interstate-migrate-staging,_GCS_BUCKET=interstate-homes-app-interstate-docs-staging,_CORS_ORIGIN=https://staging.interstatehomes.com,_EMAIL_PROVIDER=console,_EMAIL_FROM=estimating@interstatehomes.com,COMMIT_SHA=${GITHUB_SHA}" \
+            --quiet

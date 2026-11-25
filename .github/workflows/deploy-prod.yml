@@ -1,0 +1,42 @@
+name: Deploy Production (Cloud Run us-west1)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy-prod:
+    name: Build, Migrate & Deploy Production
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/1072600078136/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: github-actions-deployer@interstate-homes-app.iam.gserviceaccount.com
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Submit Cloud Build (Production)
+        # Note: Switch _EMAIL_PROVIDER to 'resend' once interstatehomes.com SPF/DKIM/DMARC is verified in Resend.
+        run: |
+          gcloud builds submit . \
+            --project=interstate-homes-app \
+            --region=us-west1 \
+            --config=cloudbuild.yaml \
+            --substitutions="_ENV=prod,_REGION=us-west1,_REPO=interstate-homes,_API_SERVICE=interstate-api-prod,_WEB_SERVICE=interstate-web-prod,_MIGRATE_JOB=interstate-migrate-prod,_GCS_BUCKET=interstate-homes-app-interstate-docs-prod,_CORS_ORIGIN=https://interstatehomes.com,_EMAIL_PROVIDER=console,_EMAIL_FROM=estimating@interstatehomes.com,COMMIT_SHA=${GITHUB_SHA}" \
+            --quiet
