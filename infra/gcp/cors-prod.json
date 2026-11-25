@@ -1,0 +1,11 @@
+[
+  {
+    "origin": [
+      "https://interstatehomes.com",
+      "https://www.interstatehomes.com"
+    ],
+    "method": ["GET", "PUT", "HEAD", "OPTIONS"],
+    "responseHeader": ["Content-Type", "ETag", "x-goog-resumable"],
+    "maxAgeSeconds": 3600
+  }
+]

@@ -1,0 +1,11 @@
+[
+  {
+    "origin": [
+      "https://staging.interstatehomes.com",
+      "http://localhost:3000"
+    ],
+    "method": ["GET", "PUT", "HEAD", "OPTIONS"],
+    "responseHeader": ["Content-Type", "ETag", "x-goog-resumable"],
+    "maxAgeSeconds": 3600
+  }
+]

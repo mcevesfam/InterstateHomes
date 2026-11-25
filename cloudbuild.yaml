@@ -3,7 +3,8 @@
 #   - Staging (branch: ^staging$): default substitutions below
 #   - Production (branch: ^main$): override _ENV=prod, _API_SERVICE=interstate-api-prod,
 #     _WEB_SERVICE=interstate-web-prod, _MIGRATE_JOB=interstate-migrate-prod,
-#     _GCS_BUCKET=<prod-bucket-name>
+#     _GCS_BUCKET=<prod-bucket-name>, _CORS_ORIGIN=https://interstatehomes.com,
+#     _EMAIL_PROVIDER=resend, _EMAIL_FROM=<verified-sender@interstatehomes.com>
 
 substitutions:
   _ENV: staging
@@ -12,7 +13,11 @@ substitutions:
   _API_SERVICE: interstate-api-staging
   _WEB_SERVICE: interstate-web-staging
   _MIGRATE_JOB: interstate-migrate-staging
-  _GCS_BUCKET: interstate-homes-docs-staging
+  _GCS_BUCKET: interstate-homes-app-interstate-docs-staging
+  _CORS_ORIGIN: https://staging.interstatehomes.com
+  # Switch _EMAIL_PROVIDER to 'resend' once interstatehomes.com is verified in Resend and _EMAIL_FROM is finalized.
+  _EMAIL_PROVIDER: console
+  _EMAIL_FROM: estimating@interstatehomes.com
 
 options:
   logging: CLOUD_LOGGING_ONLY
@@ -113,7 +118,7 @@ steps:
       - --port=8080
       - --allow-unauthenticated
       - --service-account=interstate-api-${_ENV}@$PROJECT_ID.iam.gserviceaccount.com
-      - --set-env-vars=NODE_ENV=production,DEMO_MODE=false,GCS_BUCKET=${_GCS_BUCKET},EMAIL_FROM=estimating@interstatehomes.com
+      - --set-env-vars=NODE_ENV=production,DEMO_MODE=false,GCS_BUCKET=${_GCS_BUCKET},CORS_ORIGIN=${_CORS_ORIGIN},EMAIL_PROVIDER=${_EMAIL_PROVIDER},EMAIL_FROM=${_EMAIL_FROM}
       - --set-secrets=DATABASE_URL=interstate-${_ENV}-database-url:latest,APP_ENCRYPTION_KEY=interstate-${_ENV}-app-encryption-key:latest,SESSION_SECRET=interstate-${_ENV}-session-secret:latest,DOCUSEAL_API_KEY=interstate-${_ENV}-docuseal-api-key:latest,RESEND_API_KEY=interstate-${_ENV}-resend-api-key:latest
       - --min-instances=0
       - --max-instances=10
