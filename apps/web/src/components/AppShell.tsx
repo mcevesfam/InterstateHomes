@@ -875,7 +875,14 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         ];
 
   const directBottomHrefs = new Set(bottomTabs.map((t) => t.href).filter(Boolean));
-  const activeRoleLabel = ROLE_LABELS[role] ?? role;
+  const MOBILE_ROLE_LABELS: Record<UserRole, string> = {
+    admin: 'Admin',
+    estimator_approver: 'Estimator',
+    project_manager: 'Project Mgr',
+    subcontractor: 'Subcontractor',
+    homeowner: 'Homeowner',
+  };
+  const mobileRoleLabel = MOBILE_ROLE_LABELS[role] ?? ROLE_LABELS[role] ?? role;
 
   async function handleSignOut() {
     setSigningOut(true);
@@ -897,9 +904,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <Link href={role === 'subcontractor' ? '/portal' : '/'} className="shrink-0">
           <InterstateLogo variant="dark" />
         </Link>
-        <div className="flex items-center gap-2 min-w-0">
-          <span className="max-w-[128px] truncate text-[10px] font-display font-semibold uppercase tracking-[0.06em] px-2 py-1 rounded bg-[#1C1C1A] border border-[#2C2C2A] text-[#FCAE1A]">
-            {activeRoleLabel}
+        <div className="flex items-center gap-2 shrink-0">
+          <span className="shrink-0 whitespace-nowrap text-[10px] font-display font-semibold uppercase tracking-[0.04em] px-2 py-1 rounded bg-[#1C1C1A] border border-[#2C2C2A] text-[#FCAE1A]">
+            {mobileRoleLabel}
           </span>
           <button
             type="button"
@@ -931,11 +938,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         aria-label="Primary navigation"
         className={`${
           mobileNavOpen ? 'translate-x-0 pointer-events-auto' : '-translate-x-full pointer-events-none'
-        } fixed inset-y-0 left-0 z-[60] w-72 max-w-[85vw] flex flex-col justify-between bg-[#111111] text-white border-r border-[#2C2C2A] overflow-y-auto transition-transform duration-200 ease-out md:static md:inset-auto md:z-auto md:w-60 md:max-w-none md:translate-x-0 md:pointer-events-auto md:flex shrink-0`}
+        } fixed inset-y-0 left-0 z-[60] h-[100dvh] w-72 max-w-[85vw] flex flex-col overflow-hidden bg-[#111111] text-white border-r border-[#2C2C2A] transition-transform duration-200 ease-out md:sticky md:top-0 md:h-screen md:z-auto md:w-60 md:max-w-none md:translate-x-0 md:pointer-events-auto md:flex shrink-0`}
       >
-        <div>
+        <div className="flex-1 min-h-0 flex flex-col">
           {/* Mobile Drawer Header */}
-          <div className="md:hidden h-14 px-4 flex items-center justify-between border-b border-[#2C2C2A]">
+          <div className="md:hidden shrink-0 h-14 px-4 flex items-center justify-between border-b border-[#2C2C2A]">
             <InterstateLogo variant="dark" />
             <button
               type="button"
@@ -948,14 +955,14 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </div>
 
           {/* Desktop Sidebar Header */}
-          <div className="hidden md:block px-5 pt-5 pb-4 border-b border-[#2C2C2A]">
+          <div className="hidden md:block shrink-0 px-5 pt-5 pb-4 border-b border-[#2C2C2A]">
             <InterstateLogo variant="dark" />
             <div className="text-[11px] text-[#9D9D97] mt-2 tracking-wide">
               Estimating &amp; Budgets
             </div>
           </div>
 
-          <nav className="px-3 py-4 space-y-5">
+          <nav className="flex-1 min-h-0 overflow-y-auto px-3 py-3 space-y-4">
             {groups.map((group) => (
               <div key={group.heading}>
                 <div className="px-2.5 mb-1.5 text-[10px] font-display font-semibold tracking-[0.12em] text-[#9D9D97]">
@@ -1007,7 +1014,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
         {/* Footer: Authenticated Session Panel (Postgres mode) OR Role Preview Switcher (Demo mode) */}
         {authMode === 'postgres' && user ? (
-          <div className="p-3.5 border-t border-[#2C2C2A] bg-[#0B0B0A] space-y-2.5 safe-bottom md:pb-3.5">
+          <div className="shrink-0 p-3.5 border-t border-[#2C2C2A] bg-[#0B0B0A] space-y-2.5 safe-bottom md:pb-3.5">
             <div className="flex items-start justify-between gap-2">
               <div className="min-w-0">
                 <div className="text-xs font-semibold text-white truncate">{user.fullName}</div>
@@ -1049,7 +1056,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             </div>
           </div>
         ) : (
-          <div className="p-3.5 border-t border-[#2C2C2A] bg-[#0B0B0A] safe-bottom md:pb-3.5">
+          <div className="shrink-0 p-3.5 border-t border-[#2C2C2A] bg-[#0B0B0A] safe-bottom md:pb-3.5">
             <label
               htmlFor="active-role-view-select"
               className="block text-[10px] font-display uppercase tracking-[0.1em] text-[#9D9D97] mb-1.5"
