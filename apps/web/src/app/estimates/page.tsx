@@ -1,11 +1,19 @@
 'use client';
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import Link from 'next/link';
 import { ChevronDown, ChevronRight, Printer } from 'lucide-react';
 import { apiFetch, formatCurrencyExact } from '@/lib/api';
 import { usePageContext } from '@/lib/page-context';
 import { useRole } from '@/lib/role-context';
 import { InterstateLogo } from '@/components/InterstateLogo';
+
+interface HomeSummary {
+  id: string;
+  homeCode: string;
+  subdivisionName: string;
+  planName: string;
+}
 
 interface EstimateLine {
   costCode: string;
@@ -29,7 +37,7 @@ interface EstimateLine {
 }
 
 interface EstimatePayload {
-  home: { id: string; homeCode: string; subdivisionName: string; planName: string };
+  home: HomeSummary;
   estimate: {
     id: string;
     versionNumber: number;
@@ -52,13 +60,6 @@ interface HomeownerProjection {
   }>;
 }
 
-const DEFAULT_HOME_OPTIONS = [
-  { id: 'home-ch-14', label: 'CH 14 — Zion 2450' },
-  { id: 'home-lk-22', label: 'LK 22 — Coral 2120' },
-  { id: 'home-ns-08', label: 'NS 08 — Copper View 3180' },
-  { id: 'home-ps-11', label: 'PS 11 — Willow 1890' },
-];
-
 function isLineActive(line: EstimateLine): boolean {
   return (
     line.extendedCents > 0 ||
@@ -70,8 +71,13 @@ function isLineActive(line: EstimateLine): boolean {
 
 export default function EstimatesPage() {
   const { role, subCompanyId } = useRole();
-  const [homeId, setHomeId] = useState('home-ch-14');
+  const [homes, setHomes] = useState<HomeSummary[]>([]);
+  const [loadingHomes, setLoadingHomes] = useState(true);
+  const [homesError, setHomesError] = useState<string | null>(null);
+  const [homeId, setHomeId] = useState('');
   const [data, setData] = useState<EstimatePayload | null>(null);
+  const [loadingEstimate, setLoadingEstimate] = useState(false);
+  const [estimateError, setEstimateError] = useState<string | null>(null);
   const [homeownerPreview, setHomeownerPreview] = useState<HomeownerProjection | null>(null);
   const [showHomeownerPdf, setShowHomeownerPdf] = useState(false);
   const [activeOnly, setActiveOnly] = useState(false);
@@ -83,18 +89,54 @@ export default function EstimatesPage() {
     if (window.matchMedia('(max-width: 767px)').matches) {
       setActiveOnly(true);
     }
-    const params = new URLSearchParams(window.location.search);
-    const paramHomeId = params.get('homeId');
-    if (paramHomeId) {
-      setHomeId(paramHomeId);
-    }
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    setLoadingHomes(true);
+    setHomesError(null);
+
+    apiFetch<{ homes: HomeSummary[] }>('/api/homes', { role, subCompanyId })
+      .then((res) => {
+        if (!active) return;
+        const list = res.homes ?? [];
+        setHomes(list);
+
+        const paramHomeId =
+          typeof window !== 'undefined'
+            ? new URLSearchParams(window.location.search).get('homeId')
+            : null;
+
+        setHomeId((current) => {
+          if (current && list.some((h) => h.id === current)) return current;
+          if (paramHomeId && list.some((h) => h.id === paramHomeId)) return paramHomeId;
+          return list[0]?.id ?? '';
+        });
+      })
+      .catch((err: unknown) => {
+        if (!active) return;
+        setHomes([]);
+        setHomeId('');
+        setHomesError(err instanceof Error ? err.message : 'Failed to load homes');
+      })
+      .finally(() => {
+        if (active) setLoadingHomes(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [role, subCompanyId]);
 
   usePageContext({
     section: 'Estimates',
-    entityType: 'home',
-    entityId: homeId,
-    entityLabel: data ? `${data.home.homeCode} (v${data.estimate.versionNumber})` : homeId,
+    entityType: homeId ? 'home' : 'workspace',
+    entityId: homeId || undefined,
+    entityLabel: data
+      ? `${data.home.homeCode} (v${data.estimate.versionNumber})`
+      : homes.length === 0
+        ? 'No Homes'
+        : homeId,
     summary: {
       homeCode: data?.home.homeCode ?? null,
       estimateStatus: data?.estimate.status ?? null,
@@ -104,28 +146,77 @@ export default function EstimatesPage() {
     },
   });
 
-  const loadEstimate = (targetHomeId: string) => {
-    apiFetch<EstimatePayload>(`/api/homes/${targetHomeId}/estimate`, { role, subCompanyId })
-      .then(setData)
-      .catch(() => {});
-  };
+  const loadEstimate = useCallback(
+    async (targetHomeId: string, isCancelled?: () => boolean) => {
+      if (!targetHomeId) {
+        setData(null);
+        setEstimateError(null);
+        setLoadingEstimate(false);
+        return;
+      }
+      setLoadingEstimate(true);
+      setEstimateError(null);
+      try {
+        const payload = await apiFetch<EstimatePayload>(`/api/homes/${targetHomeId}/estimate`, {
+          role,
+          subCompanyId,
+        });
+        if (isCancelled?.()) return;
+        setData(payload);
+      } catch (err: unknown) {
+        if (isCancelled?.()) return;
+        setData(null);
+        setEstimateError(err instanceof Error ? err.message : 'Failed to load estimate');
+      } finally {
+        if (!isCancelled?.()) setLoadingEstimate(false);
+      }
+    },
+    [role, subCompanyId]
+  );
 
   useEffect(() => {
-    loadEstimate(homeId);
-  }, [homeId, role, subCompanyId]);
+    if (!homeId) {
+      setData(null);
+      setHomeownerPreview(null);
+      setShowHomeownerPdf(false);
+      setEstimateError(null);
+      setLoadingEstimate(false);
+      return;
+    }
+
+    let cancelled = false;
+    setData(null);
+    setHomeownerPreview(null);
+    setShowHomeownerPdf(false);
+    void loadEstimate(homeId, () => cancelled);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [homeId, loadEstimate]);
 
   const handleToggleHomeownerPdf = async () => {
+    if (!homeId) return;
     if (!showHomeownerPdf) {
-      const res = await apiFetch<{ projection: HomeownerProjection }>(
-        `/api/homes/${homeId}/estimate/homeowner`,
-        { role, subCompanyId }
-      );
-      setHomeownerPreview(res.projection);
+      try {
+        const res = await apiFetch<{ projection: HomeownerProjection }>(
+          `/api/homes/${homeId}/estimate/homeowner`,
+          { role, subCompanyId }
+        );
+        setHomeownerPreview(res.projection);
+        setShowHomeownerPdf(true);
+      } catch (err: unknown) {
+        setEstimateError(
+          err instanceof Error ? err.message : 'Failed to load homeowner estimate preview'
+        );
+      }
+      return;
     }
-    setShowHomeownerPdf((v) => !v);
+    setShowHomeownerPdf(false);
   };
 
   const handleSelectCompetingSub = async (costCode: string, subId: string, totalCents: number) => {
+    if (!homeId) return;
     await apiFetch(`/api/estimates/${homeId}/lines/${costCode}`, {
       method: 'PATCH',
       role,
@@ -135,7 +226,7 @@ export default function EstimatesPage() {
         fixedAmountCents: totalCents,
       }),
     });
-    loadEstimate(homeId);
+    await loadEstimate(homeId);
   };
 
   const classificationGroups = useMemo(() => {
@@ -204,19 +295,6 @@ export default function EstimatesPage() {
     setCollapsedCodes(next);
   };
 
-  const homeOptions = useMemo(() => {
-    if (
-      data?.home &&
-      !DEFAULT_HOME_OPTIONS.some((opt) => opt.id === data.home.id)
-    ) {
-      return [
-        { id: data.home.id, label: `${data.home.homeCode} — ${data.home.planName}` },
-        ...DEFAULT_HOME_OPTIONS,
-      ];
-    }
-    return DEFAULT_HOME_OPTIONS;
-  }, [data]);
-
   return (
     <div className="space-y-5">
       <div
@@ -232,36 +310,94 @@ export default function EstimatesPage() {
             Internal vs. Homeowner PDF output.
           </p>
         </div>
-        <div className="flex flex-col sm:flex-row w-full sm:w-auto items-stretch sm:items-center gap-2.5">
-          <select
-            aria-label="Select home estimate"
-            value={homeId}
-            onChange={(e) => {
-              setHomeId(e.target.value);
-              setShowHomeownerPdf(false);
-              setSelectedClassification('all');
-            }}
-            className="w-full sm:w-auto min-h-[44px] border border-[#E3E3DE] bg-white rounded-md px-3 py-2 text-base sm:text-xs font-semibold text-[#111111]"
-          >
-            {homeOptions.map((opt) => (
-              <option key={opt.id} value={opt.id}>
-                {opt.label}
-              </option>
-            ))}
-          </select>
-          {(role === 'admin' || role === 'estimator_approver') && (
-            <button
-              type="button"
-              onClick={handleToggleHomeownerPdf}
-              className="w-full sm:w-auto min-h-[44px] flex items-center justify-center px-4 py-2 rounded-md bg-[#FCAE1A] text-xs font-display font-bold text-[#111111] hover:bg-[#111111] hover:text-white active:bg-[#111111] active:text-white transition-colors"
+        {homes.length > 0 ? (
+          <div className="flex flex-col sm:flex-row w-full sm:w-auto items-stretch sm:items-center gap-2.5">
+            <select
+              aria-label="Select home estimate"
+              value={homeId}
+              onChange={(e) => {
+                setHomeId(e.target.value);
+                setShowHomeownerPdf(false);
+                setSelectedClassification('all');
+              }}
+              className="w-full sm:w-auto min-h-[44px] border border-[#E3E3DE] bg-white rounded-md px-3 py-2 text-base sm:text-xs font-semibold text-[#111111]"
             >
-              {showHomeownerPdf ? 'Back to Internal Builder' : 'Preview Homeowner Estimate PDF'}
-            </button>
-          )}
-        </div>
+              {homes.map((home) => (
+                <option key={home.id} value={home.id}>
+                  {home.homeCode} — {home.planName}
+                </option>
+              ))}
+            </select>
+            {(role === 'admin' || role === 'estimator_approver') && homeId ? (
+              <button
+                type="button"
+                onClick={handleToggleHomeownerPdf}
+                disabled={loadingEstimate || !data}
+                className="w-full sm:w-auto min-h-[44px] flex items-center justify-center px-4 py-2 rounded-md bg-[#FCAE1A] text-xs font-display font-bold text-[#111111] hover:bg-[#111111] hover:text-white active:bg-[#111111] active:text-white disabled:opacity-50 transition-colors"
+              >
+                {showHomeownerPdf ? 'Back to Internal Builder' : 'Preview Homeowner Estimate PDF'}
+              </button>
+            ) : null}
+          </div>
+        ) : null}
       </div>
 
-      {showHomeownerPdf && homeownerPreview ? (
+      {homesError ? (
+        <div className="bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] px-4 py-3 rounded-lg text-xs">
+          Unable to load homes: {homesError}
+        </div>
+      ) : null}
+
+      {loadingHomes ? (
+        <div className="bg-white border border-[#E3E3DE] rounded-lg px-5 py-10 text-center space-y-2">
+          <div className="text-sm font-display font-semibold text-[#111111]">
+            Loading homes…
+          </div>
+          <p className="text-xs text-[#5F5F5A]">
+            Fetching active homes and 81-code estimate schedules.
+          </p>
+        </div>
+      ) : homes.length === 0 ? (
+        <div className="bg-white border border-[#E3E3DE] rounded-lg px-5 py-10 text-center space-y-4">
+          <div className="space-y-1.5 max-w-md mx-auto">
+            <h2 className="text-base font-display font-bold text-[#111111]">
+              No homes ready for estimating yet
+            </h2>
+            <p className="text-xs text-[#5F5F5A]">
+              Create a home in Plan Intake to initialize all 81 estimate cost codes and begin
+              building quotes and subcontractor comparisons.
+            </p>
+          </div>
+          <div className="flex justify-center">
+            <Link
+              href="/homes?intake=1"
+              className="w-full sm:w-auto min-h-[44px] inline-flex items-center justify-center px-5 py-2.5 rounded-md bg-[#FCAE1A] text-xs font-display font-bold text-[#111111] hover:bg-[#111111] hover:text-white active:bg-[#111111] active:text-white transition-colors"
+            >
+              + New Plan Intake
+            </Link>
+          </div>
+        </div>
+      ) : estimateError ? (
+        <div className="bg-[#FEF2F2] border border-[#FECACA] text-[#991B1B] px-4 py-4 rounded-lg text-xs space-y-3">
+          <div>Unable to load estimate for the selected home: {estimateError}</div>
+          <button
+            type="button"
+            onClick={() => void loadEstimate(homeId)}
+            className="min-h-[44px] inline-flex items-center justify-center px-4 py-2 rounded-md border border-[#991B1B] bg-white text-[#991B1B] font-display font-semibold hover:bg-[#991B1B] hover:text-white transition-colors"
+          >
+            Retry
+          </button>
+        </div>
+      ) : loadingEstimate || !data ? (
+        <div className="bg-white border border-[#E3E3DE] rounded-lg px-5 py-10 text-center space-y-2">
+          <div className="text-sm font-display font-semibold text-[#111111]">
+            Loading estimate…
+          </div>
+          <p className="text-xs text-[#5F5F5A]">
+            Fetching 81-code line items and competing subcontractor quotes.
+          </p>
+        </div>
+      ) : showHomeownerPdf && homeownerPreview ? (
         <div className="max-w-4xl mx-auto space-y-3">
           <div
             data-print-hide="true"
@@ -348,12 +484,12 @@ export default function EstimatesPage() {
           <div className="bg-white border border-[#E3E3DE] rounded-lg p-3.5 sm:px-4 sm:py-3 space-y-3">
             <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center justify-between gap-2">
               <div className="text-xs text-[#3B3B38]">
-                <strong className="text-[#111111]">{data?.home.homeCode}</strong> ·{' '}
-                {data?.home.subdivisionName} · {data?.home.planName} · Estimate v
-                {data?.estimate.versionNumber} ({data?.estimate.status})
+                <strong className="text-[#111111]">{data.home.homeCode}</strong> ·{' '}
+                {data.home.subdivisionName} · {data.home.planName} · Estimate v
+                {data.estimate.versionNumber} ({data.estimate.status})
               </div>
               <div className="text-sm font-display font-bold text-[#111111] tabular-nums">
-                Total Estimate: {formatCurrencyExact(data?.estimate.totalEstimatedCents)}
+                Total Estimate: {formatCurrencyExact(data.estimate.totalEstimatedCents)}
               </div>
             </div>
 
@@ -619,7 +755,7 @@ export default function EstimatesPage() {
             );
           })}
 
-          {data && visibleGroups.length === 0 ? (
+          {visibleGroups.length === 0 ? (
             <div className="bg-white border border-[#E3E3DE] rounded-lg px-4 py-8 text-center text-xs text-[#5F5F5A] space-y-2">
               <div>No active estimate lines match the current filter.</div>
               <button
